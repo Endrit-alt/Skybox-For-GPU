@@ -1,0 +1,149 @@
+plugins {
+	id 'java'
+}
+
+repositories {
+	mavenLocal()
+	maven {
+		url = 'https://repo.runelite.net'
+		content {
+			includeGroupByRegex("net\\.runelite.*")
+		}
+	}
+	mavenCentral()
+}
+
+// Tested on 1.13.1; override with -PruneLiteVersion=<version> to build against another client.
+def runeLiteVersion = findProperty('runeLiteVersion') ?: '1.13.1'
+// Water is built into this plugin (package com.endrit.gpusky.water); the old
+// standalone Water JAR must not be loaded next to it, or water is drawn twice.
+if (findProperty('waterPluginJar')) {
+	throw new GradleException('Water is now part of Skybox for GPU; drop -PwaterPluginJar')
+}
+def shadowPluginJar = findProperty('shadowPluginJar') ? file(property('shadowPluginJar')) : null
+def pluginMainClass = shadowPluginJar != null ? 'com.endrit.gpusky.GpuSkyWaterShadowPluginTest'
+	: 'com.endrit.gpusky.GpuSkyExtensionPluginTest'
+def isolatedGpuTest = project.hasProperty('isolatedGpuTest') || project.hasProperty('upstreamGpuTest')
+def isolatedTestHome = file('build/upstream-1.13-test/home')
+def gpuApiProject = file(findProperty('gpuApiProject') ?: '../adam-gpu-api-1.13.1')
+def customRuneLiteVersion = runeLiteVersion
+def gpuApiJar = file("${gpuApiProject}/runelite-client/build/libs/client-${customRuneLiteVersion}.jar")
+def gpuApiShadedJar = file("${gpuApiProject}/runelite-client/build/libs/client-${customRuneLiteVersion}-shaded.jar")
+def runeLiteApiJar = file("${gpuApiProject}/runelite-api/build/libs/runelite-api-${customRuneLiteVersion}.jar")
+
+configurations {
+	pluginHubVersionResolver {
+		canBeConsumed = false
+		canBeResolved = true
+		transitive = false
+	}
+}
+
+dependencies {
+	compileOnly files(gpuApiJar, runeLiteApiJar)
+	compileOnly group: 'net.runelite', name: 'client', version: runeLiteVersion
+
+	testImplementation 'junit:junit:4.13.2'
+	testImplementation files(gpuApiShadedJar)
+	if (shadowPluginJar != null) {
+		testImplementation files(shadowPluginJar)
+	}
+	pluginHubVersionResolver "net.runelite:client:${runeLiteVersion}@pom"
+}
+
+if (shadowPluginJar != null) {
+	sourceSets.test.java.srcDir 'src/shadowTest/java'
+}
+
+group = 'com.endrit.gpusky'
+version = '1.0-SNAPSHOT'
+
+tasks.withType(JavaCompile).configureEach {
+	options.encoding = 'UTF-8'
+	options.release.set(11)
+}
+
+tasks.register('runClient', JavaExec) {
+	dependsOn ':testClasses'
+	classpath = sourceSets.test.runtimeClasspath
+	mainClass = pluginMainClass
+	jvmArgs '-ea'
+	if (isolatedGpuTest)
+	{
+		systemProperty 'user.home', isolatedTestHome.absolutePath
+		args '--debug', '--disable-telemetry', '--noupdate', '--profile=Skybox-GPU-API-Test'
+	}
+	else if (shadowPluginJar != null)
+	{
+		args '--debug'
+	}
+	else
+	{
+		args '--developer-mode', '--debug'
+	}
+	doFirst {
+		if (shadowPluginJar != null)
+		{
+			if (!shadowPluginJar.isFile()) throw new GradleException("Build the Model Shadow Reducer JAR first: ${shadowPluginJar}")
+			println "Joint development launch with Model Shadow Reducer: ${shadowPluginJar}"
+		}
+		if (isolatedGpuTest)
+		{
+			if (!new File(isolatedTestHome, '.runelite/profiles2/Skybox-GPU-API-Test-1.properties').isFile())
+			{
+				throw new GradleException('Prepare the isolated GPU API test profile before launching')
+			}
+			// Reuse the development login in memory only; do not copy credentials into the test home.
+			def credentialsFile = new File(System.getProperty('user.home'), '.runelite/credentials.properties')
+			if (credentialsFile.isFile() && !environment['JX_SESSION_ID'])
+			{
+				def credentials = new Properties()
+				credentialsFile.withInputStream { credentials.load(it) }
+				['JX_CHARACTER_ID', 'JX_SESSION_ID', 'JX_REFRESH_TOKEN', 'JX_DISPLAY_NAME', 'JX_ACCESS_TOKEN'].each { key ->
+					if (credentials.getProperty(key)) environment key, credentials.getProperty(key)
+				}
+				credentials.clear()
+			}
+			println "Isolated GPU API test: ${isolatedTestHome} (no Hub plugins configured)"
+		}
+		def stableClient = configurations.pluginHubVersionResolver.resolvedConfiguration
+			.firstLevelModuleDependencies
+			.find { it.moduleGroup == 'net.runelite' && it.moduleName == 'client' }
+		if (stableClient == null)
+		{
+			throw new GradleException('Unable to resolve the stable RuneLite version for Plugin Hub manifests')
+		}
+		def resolvedStableRuneLiteVersion = stableClient.moduleVersion
+		systemProperty 'runelite.pluginhub.version', resolvedStableRuneLiteVersion
+		println "Custom RuneLite runtime: ${customRuneLiteVersion} (${gpuApiShadedJar})"
+		println "Plugin Hub manifest: ${resolvedStableRuneLiteVersion}"
+	}
+}
+
+tasks.register('run') {
+	dependsOn 'runClient'
+}
+
+
+tasks.register('shadowJar', Jar) {
+	dependsOn configurations.testRuntimeClasspath
+	manifest {
+		attributes('Main-Class': pluginMainClass, 'Multi-Release': true)
+	}
+	duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+	from sourceSets.main.output
+	from sourceSets.test.output
+	from {
+		configurations.testRuntimeClasspath.collect { file ->
+			file.isDirectory() ? file : zipTree(file)
+		}
+	}
+	exclude 'META-INF/INDEX.LIST'
+	exclude 'META-INF/*.SF'
+	exclude 'META-INF/*.DSA'
+	exclude 'META-INF/*.RSA'
+	exclude '**/module-info.class'
+	group = BasePlugin.BUILD_GROUP
+	archiveClassifier.set('shadow')
+	archiveFileName.set("${rootProject.name}-${project.version}-all.jar")
+}

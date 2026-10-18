@@ -1,0 +1,15 @@
+.gradle/
+build/
+out/
+*.iml
+.idea/
+*.log
+hs_err_pid*.log
+
+# Local development only
+backups/
+run-sky-water.bat
+run-sky-water-shadow.bat
+run-test-client.bat
+AGENTS.md
+src/shadowTest/
