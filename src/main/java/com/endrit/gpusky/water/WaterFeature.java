@@ -3,6 +3,7 @@ package com.endrit.gpusky.water;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Function;
@@ -19,6 +20,7 @@ import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginManager;
 import net.runelite.client.plugins.gpu.GpuPlugin;
 import net.runelite.client.plugins.gpu.api.GpuApi;
+import net.runelite.client.plugins.gpu.api.GpuExtension;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -81,9 +83,12 @@ public final class WaterFeature
 	private final PluginManager pluginManager;
 	private final WaterConfig config;
 	private final Plugin owner;
+	/** The owner's list of closed extensions still registered (client thread only); see stop(). */
+	private final List<GpuExtension> staleExtensions;
 	private final AtomicInteger lifecycle = new AtomicInteger();
 	private volatile ModernAnimatedWaterExtension extension;
-	private volatile boolean extensionRegistered;
+	/** Client thread only, so registration and unregistration are decided in one place. */
+	private ModernAnimatedWaterExtension registeredExtension;
 	private volatile java.util.function.Supplier<java.awt.Color> waterColorOverride = () -> null;
 	private volatile java.util.function.BooleanSupplier instantTransitions = () -> false;
 
@@ -104,7 +109,7 @@ public final class WaterFeature
 	}
 
 	public WaterFeature(Client client, ClientThread clientThread, GpuApi gpuApi, PluginManager pluginManager,
-		WaterConfig config, Plugin owner)
+		WaterConfig config, Plugin owner, List<GpuExtension> staleExtensions)
 	{
 		this.client = client;
 		this.clientThread = clientThread;
@@ -112,6 +117,7 @@ public final class WaterFeature
 		this.pluginManager = pluginManager;
 		this.config = config;
 		this.owner = owner;
+		this.staleExtensions = staleExtensions;
 	}
 
 	/** One-time copy of settings saved by the old standalone Water plugin into {@code group}. */
@@ -186,8 +192,14 @@ public final class WaterFeature
 			{
 				return false;
 			}
+			// GPU is running now, so leftovers from a stop while it was off can go.
+			for (GpuExtension stale : staleExtensions)
+			{
+				gpuApi.unregisterExtension(owner, stale);
+			}
+			staleExtensions.clear();
 			gpuApi.registerExtension(owner, nextExtension);
-			extensionRegistered = true;
+			registeredExtension = nextExtension;
 			// Late registration: the API recompiles shaders but does not issue a context callback.
 			nextExtension.onContextCreate();
 			nextExtension.attachDrawCallbacks();
@@ -200,20 +212,33 @@ public final class WaterFeature
 	{
 		lifecycle.incrementAndGet();
 		ModernAnimatedWaterExtension current = extension;
-		boolean registered = extensionRegistered;
 		extension = null;
-		extensionRegistered = false;
+		if (current == null) return;
+		// Decided on the client thread: a pending registration is cancelled by its lifecycle
+		// check, and one that already ran is always seen here.
 		clientThread.invokeLater(() ->
 		{
-			if (current != null) current.detachDrawCallbacks();
-			if (registered)
+			current.detachDrawCallbacks();
+			boolean registered = registeredExtension == current;
+			if (registered) registeredExtension = null;
+			// The same readiness test as start(): the built-in GPU plugin must be on. Another
+			// renderer (117 HD) also sets the GPU flag and callbacks, but it is not our context.
+			boolean gpuRunning = pluginManager.getPlugins().stream()
+				.anyMatch(plugin -> plugin instanceof GpuPlugin && pluginManager.isPluginActive(plugin))
+				&& client.isGpu() && client.getDrawCallbacks() != null;
+			if (registered && gpuRunning)
 			{
 				gpuApi.unregisterExtension(owner, current);
 			}
-			if (current != null)
+			else if (registered)
 			{
-				current.close();
+				// Same partial mitigation as the skybox (GpuSkyExtensionPlugin.shutDown): with GPU
+				// already stopped, unregistering would queue a recompile without a GL context, so
+				// the closed extension stays registered until GPU runs again. A GPU stop after
+				// this check but before the queued recompile can still hit that API race.
+				staleExtensions.add(current);
 			}
+			current.close();
 		});
 	}
 

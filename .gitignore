@@ -13,3 +13,5 @@ run-sky-water-shadow.bat
 run-test-client.bat
 AGENTS.md
 src/shadowTest/
+src/test/
+Skybox for GPU.bat

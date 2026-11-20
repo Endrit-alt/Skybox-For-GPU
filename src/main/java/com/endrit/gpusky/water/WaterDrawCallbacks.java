@@ -25,10 +25,14 @@ final class WaterDrawCallbacks implements DrawCallbacks
 		void afterScene(Scene scene, float cameraX, float cameraY, float cameraZ);
 		void drawZone(DrawCallbacks delegate, Projection projection, Scene scene, int x, int z);
 		default void beforeAlpha() { }
+		/** Before the top-level scene's frame starts (before the GPU plugin clears its scene buffers). */
+		default void beforeScene() { }
 		default void drawAlpha(DrawCallbacks delegate, Projection projection, Scene scene, int level, int x, int z)
 		{
 			delegate.drawZoneAlpha(projection, scene, level, x, z);
 		}
+		/** A callback threw; this wrapper is already pass-through. Must not throw. */
+		default void callbackFailed(String during, Throwable ex) { }
 	}
 
 	final DrawCallbacks delegate;
@@ -44,6 +48,23 @@ final class WaterDrawCallbacks implements DrawCallbacks
 
 	void deactivate() { listener = null; }
 
+	/**
+	 * Water errors must not escape into the GPU plugin's frame. The wrapper becomes
+	 * pass-through at once; the listener switches water off and cleans up later.
+	 */
+	private void failed(Listener current, String during, Throwable ex)
+	{
+		deactivate();
+		try
+		{
+			current.callbackFailed(during, ex);
+		}
+		catch (Throwable ignored)
+		{
+			// Already pass-through; nothing more can be done here.
+		}
+	}
+
 	@Override
 	public String toString()
 	{
@@ -56,8 +77,20 @@ final class WaterDrawCallbacks implements DrawCallbacks
 	public void drawZoneOpaque(Projection entityProjection, Scene scene, int zx, int zz)
 	{
 		Listener current = listener;
-		if (current != null) current.drawZone(delegate, entityProjection, scene, zx, zz);
-		else delegate.drawZoneOpaque(entityProjection, scene, zx, zz);
+		if (current == null)
+		{
+			delegate.drawZoneOpaque(entityProjection, scene, zx, zz);
+			return;
+		}
+		try
+		{
+			current.drawZone(delegate, entityProjection, scene, zx, zz);
+		}
+		catch (Throwable ex)
+		{
+			// This zone may be missing for one frame; later frames pass straight through.
+			failed(current, "drawing an opaque zone", ex);
+		}
 	}
 
 	@Override
@@ -71,8 +104,15 @@ final class WaterDrawCallbacks implements DrawCallbacks
 		}
 		// Fallback for callback chains that do not forward PRE_PASS_ALPHA. Alpha
 		// objects do not write depth, so water MUST already be composited here.
-		current.beforeAlpha();
-		current.drawAlpha(delegate, entityProjection, scene, level, zx, zz);
+		try
+		{
+			current.beforeAlpha();
+			current.drawAlpha(delegate, entityProjection, scene, level, zx, zz);
+		}
+		catch (Throwable ex)
+		{
+			failed(current, "drawing an alpha zone", ex);
+		}
 	}
 
 	@Override
@@ -80,10 +120,38 @@ final class WaterDrawCallbacks implements DrawCallbacks
 		float cameraX, float cameraY, float cameraZ, float cameraPitch, float cameraYaw,
 		int minLevel, int level, int maxLevel, Set<Integer> hideRoofIds)
 	{
+		beforeScene(scene);
 		delegate.preSceneDraw(scene, entityProjection, cameraX, cameraY, cameraZ, cameraPitch, cameraYaw,
 			minLevel, level, maxLevel, hideRoofIds);
+		afterScene(scene, cameraX, cameraY, cameraZ);
+	}
+
+	private void beforeScene(Scene scene)
+	{
 		Listener current = listener;
-		if (current != null) current.afterScene(scene, cameraX, cameraY, cameraZ);
+		if (current == null || scene.getWorldViewId() != WorldView.TOPLEVEL) return;
+		try
+		{
+			current.beforeScene();
+		}
+		catch (Throwable ex)
+		{
+			failed(current, "preparing water before the scene", ex);
+		}
+	}
+
+	private void afterScene(Scene scene, float cameraX, float cameraY, float cameraZ)
+	{
+		Listener current = listener;
+		if (current == null) return;
+		try
+		{
+			current.afterScene(scene, cameraX, cameraY, cameraZ);
+		}
+		catch (Throwable ex)
+		{
+			failed(current, "preparing the scene", ex);
+		}
 	}
 
 	@Override
@@ -92,10 +160,10 @@ final class WaterDrawCallbacks implements DrawCallbacks
 		float cameraX, float cameraY, float cameraZ, float cameraPitch, float cameraYaw,
 		int minLevel, int level, int maxLevel, Set<Integer> hideRoofIds)
 	{
+		beforeScene(scene);
 		delegate.preSceneDraw(scene, cameraX, cameraY, cameraZ, cameraPitch, cameraYaw,
 			minLevel, level, maxLevel, hideRoofIds);
-		Listener current = listener;
-		if (current != null) current.afterScene(scene, cameraX, cameraY, cameraZ);
+		afterScene(scene, cameraX, cameraY, cameraZ);
 	}
 
 	@Override
@@ -107,7 +175,14 @@ final class WaterDrawCallbacks implements DrawCallbacks
 		{
 			// Let the GPU finish alpha-pass setup (including world-view transforms),
 			// then draw water before any transparent faces are submitted.
-			current.beforeAlpha();
+			try
+			{
+				current.beforeAlpha();
+			}
+			catch (Throwable ex)
+			{
+				failed(current, "drawing water before the alpha pass", ex);
+			}
 		}
 	}
 

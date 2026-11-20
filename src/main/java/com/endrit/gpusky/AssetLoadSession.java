@@ -5,6 +5,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /** Loader-owned state is never reused by a later plugin startup. */
 final class AssetLoadSession
@@ -15,12 +16,20 @@ final class AssetLoadSession
 	final Map<String, SkyboxAsset> preloaded = new LinkedHashMap<>();
 	final Map<GpuSkyExtensionConfig.WeatherEffect, WeatherLoadState> weather =
 		new EnumMap<>(GpuSkyExtensionConfig.WeatherEffect.class);
+	/** Decoded weather sprite sets, shared by the layers and effects that use the same frames. */
+	final WeatherRenderer.SpriteCache weatherSprites = new WeatherRenderer.SpriteCache();
+	/** Bumped on every GPU context change; completed weather loads again for the new context. */
+	final AtomicInteger weatherContext = new AtomicInteger();
 	String skyboxSignature;
 	String preloadSignature;
 	String regionState;
 	GpuSkyExtensionConfig.WeatherEffect publishedMainWeather;
 	int skyboxContext = -1;
 	volatile SkyboxUploadBatch uploads;
+	/** Loading paused after an out-of-memory error, until a deliberate trigger clears it. */
+	volatile boolean memoryBlocked;
+	/** Loading stopped for this plugin start after an unexpected Error. */
+	volatile boolean stopped;
 	private volatile boolean cancelled;
 
 	void cancel()

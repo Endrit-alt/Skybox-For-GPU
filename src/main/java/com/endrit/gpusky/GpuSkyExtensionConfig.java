@@ -121,7 +121,7 @@ public interface GpuSkyExtensionConfig extends WaterConfig
 	)
 	default int exposure()
 	{
-		return 110;
+		return GpuSkyExtensionPlugin.DEFAULT_EXPOSURE;
 	}
 
 	@ConfigItem(keyName = "instantTransitions", name = "Instant transitions", description = "Switch panoramas without crossfading", position = 2, section = SKYBOX_SECTION)
@@ -303,7 +303,8 @@ public interface GpuSkyExtensionConfig extends WaterConfig
 		SNOW("Snow", "Snow.jpg", 6),
 		ASH("Ashfall", "Ashfall.jpg", 3),
 		PESTILENCE("Bloodfall", "Bloodfall.jpg", 2),
-		SIROCCO("Sandstorm", "Sandstorm.jpg", 1);
+		SIROCCO("Sandstorm", "Sandstorm.jpg", 1),
+		GALAXY("Galaxy", "TFA.jpg", 0);
 
 		private final String displayName;
 		private final String skyboxFilename;
@@ -347,7 +348,8 @@ public interface GpuSkyExtensionConfig extends WaterConfig
 		ASH("Ashfall", "Ashfall.jpg"),
 		PESTILENCE("Bloodfall", "Bloodfall.jpg"),
 		SIROCCO("Sandstorm", "Sandstorm.jpg"),
-		COX("Cox", "Cox.jpg");
+		COX("Cox", "Cox.jpg"),
+		TFA("Galaxy", "TFA.jpg");
 
 		private final String displayName;
 		private final String presetFilename;
@@ -387,7 +389,8 @@ public interface GpuSkyExtensionConfig extends WaterConfig
 		SNOW("Snow"),
 		ASH("Ashfall"),
 		PESTILENCE("Bloodfall"),
-		SIROCCO("Sandstorm");
+		SIROCCO("Sandstorm"),
+		GALAXY("Galaxy");
 
 		private final String displayName;
 

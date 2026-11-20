@@ -26,11 +26,12 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 import javax.inject.Inject;
 import javax.swing.SwingUtilities;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
-import net.runelite.api.Player;
+import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
@@ -39,17 +40,20 @@ import net.runelite.api.hooks.DrawCallbacks;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.callback.RenderCallbackManager;
 import net.runelite.client.config.ConfigManager;
+import net.runelite.client.config.ConfigProfile;
 import com.endrit.gpusky.water.WaterFeature;
 import net.runelite.client.eventbus.EventBus;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.ConfigChanged;
 import net.runelite.client.events.PluginChanged;
+import net.runelite.client.events.ProfileChanged;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDependency;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.plugins.PluginManager;
 import net.runelite.client.plugins.gpu.GpuPlugin;
 import net.runelite.client.plugins.gpu.api.GpuApi;
+import net.runelite.client.plugins.gpu.api.GpuExtension;
 import net.runelite.client.ui.ClientToolbar;
 import net.runelite.client.ui.NavigationButton;
 import net.runelite.client.util.Filepath;
@@ -70,6 +74,18 @@ public class GpuSkyExtensionPlugin extends Plugin
 	private static final String FALLBACK_SKYBOX = "weather/presets/Daylight.jpg";
 	private static final String REGION_OVERRIDES_KEY = "regionOverrides";
 	private static final String COX_OVERRIDE_SEEDED_KEY = "coxOverrideSeeded";
+	/** Panorama exposure default (was 110 until 2026-11-15). */
+	static final int DEFAULT_EXPOSURE = 140;
+	private static final int OLD_DEFAULT_EXPOSURE = 110;
+	/** Set per profile once the 110 -> 140 exposure default change has been applied to it. */
+	private static final String EXPOSURE_140_KEY = "exposureDefault140Applied";
+	private static final long MEMORY_NOTICE_NANOS = 20_000_000_000L;
+	private static final int MAX_INSTALL_ATTEMPTS = 3;
+	private volatile long memoryNoticeUntil;
+	/** Loader thread: incomplete bundled-asset installs this start. */
+	private int installFailures;
+	/** Raw copy of overrides that could not be parsed, kept so nothing is lost. */
+	static final String UNREADABLE_OVERRIDES_KEY = "regionOverridesUnreadable";
 
 	@Inject
 	private Client client;
@@ -113,14 +129,26 @@ public class GpuSkyExtensionPlugin extends Plugin
 	private volatile GpuSkyExtension extension;
 	private volatile AssetLoadSession loadSession;
 	private volatile Filepath skyboxDirectory;
-	private volatile boolean extensionRegistered;
+	// Client thread only, so registration and unregistration are decided in one place.
+	private GpuSkyExtension registeredExtension;
+	// Closed (inert) extensions, skybox and water, left registered because GPU had already
+	// stopped (see shutDown). Client thread only; unregistered by the next registration.
+	private final List<GpuExtension> staleExtensions = new ArrayList<>();
 	private volatile boolean waitingForSkyboxContext;
 	private String loadedOverridesJson;
+	/** Profile the in-memory overrides were read from; edits are refused while it is not the active one. */
+	private long overridesProfile = Long.MIN_VALUE;
+	/** Saved overrides could not be parsed: saving is refused until the user starts over. */
+	private volatile boolean overridesUnreadable;
+	/** A panorama was loaded below the selected resolution because of RuneLite's memory limit. */
+	private volatile boolean resolutionReducedForMemory;
+	private final Set<String> reducedResolutionWarnings = java.util.concurrent.ConcurrentHashMap.newKeySet();
 	private volatile RegionContext regionContext = new RegionContext();
 	private volatile List<RegionOverride> regionOverrides = Collections.emptyList();
-	private RegionOverridePanel regionOverridePanel;
+	private volatile RegionOverridePanel regionOverridePanel;
 	private NavigationButton navigationButton;
 	private SkyboxLoadingOverlay loadingOverlay;
+	private volatile TextureQualitySetup textureQualitySetup;
 	private WaterFeature water;
 	/** Region water color published with the skybox (null = main setting). */
 	private volatile java.awt.Color publishedRegionWaterColor;
@@ -135,6 +163,8 @@ public class GpuSkyExtensionPlugin extends Plugin
 	protected void startUp()
 	{
 		migrateTextureResolution();
+		resetTextureQualitySetup();
+		resolutionReducedForMemory = false;
 		refreshRegionOverrides();
 		waitingForSkyboxContext = config.preloadSkyboxPresets();
 		loadingOverlay = new SkyboxLoadingOverlay(client, this);
@@ -153,14 +183,18 @@ public class GpuSkyExtensionPlugin extends Plugin
 			}
 			DrawCallbacks callbacks = client.getDrawCallbacks();
 			refreshRegionContext();
-			boolean gpuActive = pluginManager.getPlugins().stream()
-				.anyMatch(plugin -> plugin instanceof GpuPlugin && pluginManager.isPluginActive(plugin));
-			if (!canRegisterWithGpu(gpuActive, client.isGpu(), callbacks))
+			if (!canRegisterWithGpu(gpuPluginActive(), client.isGpu(), callbacks))
 			{
 				return false;
 			}
+			// GPU is running now, so leftovers from a shutdown while it was off can go.
+			for (GpuExtension stale : staleExtensions)
+			{
+				gpuApi.unregisterExtension(this, stale);
+			}
+			staleExtensions.clear();
 			gpuApi.registerExtension(this, currentExtension);
-			extensionRegistered = true;
+			registeredExtension = currentExtension;
 			// Late API registration does not issue a context callback on this fork.
 			currentExtension.onContextCreate();
 			log.debug("Skybox GPU extension initialized with draw callbacks {}", callbacks.getClass().getName());
@@ -182,11 +216,12 @@ public class GpuSkyExtensionPlugin extends Plugin
 		});
 		AssetLoadSession session = new AssetLoadSession();
 		loadSession = session;
-		watcher = loader.scheduleWithFixedDelay(() -> pollFilesAndConfig(session), 0, 1, TimeUnit.SECONDS);
+		installFailures = 0;
+		watcher = loader.scheduleWithFixedDelay(() -> poll(session), 0, 1, TimeUnit.SECONDS);
 		// Water registers after the skybox extension (queued after it on the client thread).
 		WaterFeature.migrateLegacySettings(configManager, GpuSkyExtensionConfig.GROUP);
 		WaterFeature.saveMissingDefaults(configManager, GpuSkyExtensionConfig.GROUP, config);
-		water = new WaterFeature(client, clientThread, gpuApi, pluginManager, config, this);
+		water = new WaterFeature(client, clientThread, gpuApi, pluginManager, config, this, staleExtensions);
 		water.setWaterColorOverride(() -> publishedRegionWaterColor);
 		water.setInstantTransitions(config::instantTransitions);
 		eventBus.register(water);
@@ -214,6 +249,22 @@ public class GpuSkyExtensionPlugin extends Plugin
 		configManager.unsetConfiguration(GpuSkyExtensionConfig.GROUP, GpuSkyExtensionConfig.LEGACY_EIGHT_K_KEY);
 	}
 
+	private void resetTextureQualitySetup()
+	{
+		TextureQualitySetup previous = textureQualitySetup;
+		if (previous != null) previous.close();
+		boolean completed = Boolean.parseBoolean(configManager.getConfiguration(
+			GpuSkyExtensionConfig.GROUP, TextureQualitySetup.COMPLETED_KEY));
+		long profileId = configManager.getProfile().getId();
+		textureQualitySetup = new TextureQualitySetup(client.getCanvas(), completed, config.textureResolution(),
+			selection ->
+			{
+				if (configManager.getProfile().getId() != profileId) return;
+				configManager.setConfiguration(GpuSkyExtensionConfig.GROUP, "textureResolution", selection);
+				configManager.setConfiguration(GpuSkyExtensionConfig.GROUP, TextureQualitySetup.COMPLETED_KEY, true);
+			}, this::requestAssetRefresh);
+	}
+
 	/** Short name of the selected texture resolution, for the loading overlay. */
 	String textureResolutionName()
 	{
@@ -226,13 +277,27 @@ public class GpuSkyExtensionPlugin extends Plugin
 		return gpuPluginActive && gpuRendering && callbacks != null;
 	}
 
+	/** The built-in GPU plugin itself is on. Another renderer (117 HD) also sets the GPU flag and callbacks. */
+	private boolean gpuPluginActive()
+	{
+		return pluginManager.getPlugins().stream()
+			.anyMatch(plugin -> plugin instanceof GpuPlugin && pluginManager.isPluginActive(plugin));
+	}
+
 	private synchronized void refreshRegionOverrides()
 	{
+		// Read the profile first: if it switches before the JSON is read, the list is labelled
+		// with the old profile and edits stay refused until the switch handler reloads it.
+		long profile = profileId();
 		String json = configManager.getConfiguration(GpuSkyExtensionConfig.GROUP, REGION_OVERRIDES_KEY);
 		if (json == null)
 		{
+			overridesUnreadable = false;
+			overridesProfile = profile;
+			applyExposureDefault(Collections.emptyList());
 			saveRegionOverrides(DefaultRegionOverrides.create(config));
 			configManager.setConfiguration(GpuSkyExtensionConfig.GROUP, COX_OVERRIDE_SEEDED_KEY, true);
+			reloadPanel();
 			return;
 		}
 		if (json.equals(loadedOverridesJson))
@@ -258,10 +323,24 @@ public class GpuSkyExtensionPlugin extends Plugin
 		catch (RuntimeException ex)
 		{
 			loadedOverridesJson = json;
-			log.warn("Unable to read region overrides", ex);
+			// Keep a copy and pause saving, so the next edit cannot replace data that may be recoverable.
+			if (!json.equals(configManager.getConfiguration(GpuSkyExtensionConfig.GROUP, UNREADABLE_OVERRIDES_KEY)))
+			{
+				configManager.setConfiguration(GpuSkyExtensionConfig.GROUP, UNREADABLE_OVERRIDES_KEY, json);
+			}
+			overridesUnreadable = true;
+			overridesProfile = profile;
+			regionOverrides = Collections.emptyList();
+			log.warn("Unable to read region overrides; kept a copy in '{}' and paused saving until the side panel's "
+				+ "Start over button is used", UNREADABLE_OVERRIDES_KEY, ex);
+			reloadPanel();
+			requestAssetRefresh();
 			return;
 		}
+		overridesUnreadable = false;
+		overridesProfile = profile;
 
+		boolean changed = applyExposureDefault(parsed);
 		if (!Boolean.parseBoolean(configManager.getConfiguration(
 			GpuSkyExtensionConfig.GROUP, COX_OVERRIDE_SEEDED_KEY)))
 		{
@@ -271,17 +350,94 @@ public class GpuSkyExtensionPlugin extends Plugin
 				parsed.add(DefaultRegionOverrides.createCox(config));
 			}
 			configManager.setConfiguration(GpuSkyExtensionConfig.GROUP, COX_OVERRIDE_SEEDED_KEY, true);
+			changed = true;
+		}
+		if (changed)
+		{
 			saveRegionOverrides(parsed);
+			reloadPanel();
 			return;
 		}
 
 		loadedOverridesJson = json;
 		regionOverrides = Collections.unmodifiableList(parsed);
+		reloadPanel();
+	}
+
+	/**
+	 * Once per profile: moves the old exposure default (110) to the new one (140), in the main
+	 * setting if it was saved as 110 and in every override still at 110. Other values are kept.
+	 * Returns whether an override changed (the caller saves the list).
+	 */
+	private boolean applyExposureDefault(List<RegionOverride> overrides)
+	{
+		if (Boolean.parseBoolean(configManager.getConfiguration(GpuSkyExtensionConfig.GROUP, EXPOSURE_140_KEY)))
+		{
+			return false;
+		}
+		configManager.setConfiguration(GpuSkyExtensionConfig.GROUP, EXPOSURE_140_KEY, true);
+		if (Integer.toString(OLD_DEFAULT_EXPOSURE).equals(
+			configManager.getConfiguration(GpuSkyExtensionConfig.GROUP, "exposure")))
+		{
+			// Unset rather than write 140, so it follows the default from now on.
+			configManager.unsetConfiguration(GpuSkyExtensionConfig.GROUP, "exposure");
+		}
+		return updateOldExposure(overrides);
+	}
+
+	/** Sets every override still at the old default exposure to the new one. */
+	static boolean updateOldExposure(List<RegionOverride> overrides)
+	{
+		boolean changed = false;
+		for (RegionOverride override : overrides)
+		{
+			if (override.exposure == OLD_DEFAULT_EXPOSURE)
+			{
+				override.exposure = DEFAULT_EXPOSURE;
+				changed = true;
+			}
+		}
+		return changed;
+	}
+
+	private void reloadPanel()
+	{
 		RegionOverridePanel panel = regionOverridePanel;
 		if (panel != null)
 		{
 			SwingUtilities.invokeLater(panel::reload);
 		}
+	}
+
+	/** The active profile; edits, imports and recordings remember it and are dropped after a switch. */
+	long profileId()
+	{
+		ConfigProfile profile = configManager.getProfile();
+		return profile == null ? -1 : profile.getId();
+	}
+
+	boolean overridesUnreadable()
+	{
+		return overridesUnreadable;
+	}
+
+	/** The edit was made for the active profile, and the in-memory list was read from it. */
+	private boolean editable(long expectedProfile)
+	{
+		return expectedProfile == profileId() && expectedProfile == overridesProfile;
+	}
+
+	/** Replaces unreadable saved overrides with the default list; the raw copy stays in its backup key. */
+	synchronized void discardUnreadableOverrides(long expectedProfile)
+	{
+		if (!overridesUnreadable || !editable(expectedProfile))
+		{
+			return;
+		}
+		overridesUnreadable = false;
+		saveRegionOverrides(DefaultRegionOverrides.create(config));
+		configManager.setConfiguration(GpuSkyExtensionConfig.GROUP, COX_OVERRIDE_SEEDED_KEY, true);
+		reloadPanel();
 	}
 
 	synchronized List<RegionOverride> regionOverrides()
@@ -294,31 +450,50 @@ public class GpuSkyExtensionPlugin extends Plugin
 		return snapshot;
 	}
 
-	synchronized RegionOverride addRegionOverride()
+	/** Adds an override, or returns null when the profile changed or saving is paused. */
+	synchronized RegionOverride addRegionOverride(long expectedProfile)
 	{
+		if (!editable(expectedProfile))
+		{
+			return null;
+		}
 		List<RegionOverride> updated = regionOverrides();
 		RegionOverride added = createRegionOverride("Region override " + (updated.size() + 1));
 		updated.add(added);
-		saveRegionOverrides(updated);
-		return added.copy();
+		return saveRegionOverrides(updated) ? added.copy() : null;
 	}
 
-	synchronized void updateRegionOverride(RegionOverride updatedOverride)
+	/**
+	 * Applies one field change to the latest saved copy of an override, found by ID, so an
+	 * editor never writes back an older copy of the other fields. Ignored after a profile
+	 * switch: the same ID (for example builtin-tfa) can exist in several profiles.
+	 */
+	synchronized boolean updateRegionOverride(String id, long expectedProfile, Consumer<RegionOverride> change)
 	{
+		if (!editable(expectedProfile))
+		{
+			return false;
+		}
 		List<RegionOverride> updated = regionOverrides();
 		for (int i = 0; i < updated.size(); i++)
 		{
-			if (updated.get(i).id.equals(updatedOverride.id))
+			RegionOverride target = updated.get(i);
+			if (target.id.equals(id))
 			{
-				updated.set(i, normalizeRegionOverride(updatedOverride, i));
-				saveRegionOverrides(updated);
-				return;
+				change.accept(target);
+				updated.set(i, normalizeRegionOverride(target, i));
+				return saveRegionOverrides(updated);
 			}
 		}
+		return false;
 	}
 
-	synchronized void removeRegionOverride(String id)
+	synchronized void removeRegionOverride(String id, long expectedProfile)
 	{
+		if (!editable(expectedProfile))
+		{
+			return;
+		}
 		List<RegionOverride> updated = regionOverrides();
 		updated.removeIf(override -> override.id.equals(id));
 		saveRegionOverrides(updated);
@@ -336,8 +511,12 @@ public class GpuSkyExtensionPlugin extends Plugin
 		return null;
 	}
 
-	synchronized void reassignRegion(int regionId, String targetId)
+	synchronized void reassignRegion(int regionId, String targetId, long expectedProfile)
 	{
+		if (!editable(expectedProfile))
+		{
+			return;
+		}
 		List<RegionOverride> updated = regionOverrides();
 		for (RegionOverride override : updated)
 		{
@@ -355,7 +534,8 @@ public class GpuSkyExtensionPlugin extends Plugin
 		{
 			for (String token : value.trim().split("[,\\s]+"))
 			{
-				if (!token.isEmpty() && !current.equals(token))
+				// By number, like conflict detection: "012889" and "+12889" are region 12889 too.
+				if (!token.isEmpty() && !RegionOverride.isRegion(token, regionId))
 				{
 					ids.add(token);
 				}
@@ -377,8 +557,14 @@ public class GpuSkyExtensionPlugin extends Plugin
 		return formatted.toString();
 	}
 
-	private void saveRegionOverrides(List<RegionOverride> overrides)
+	private boolean saveRegionOverrides(List<RegionOverride> overrides)
 	{
+		if (overridesUnreadable)
+		{
+			log.warn("Not saving region overrides: the saved list could not be read (a copy is in '{}'). "
+				+ "Use Start over in the side panel to replace it.", UNREADABLE_OVERRIDES_KEY);
+			return false;
+		}
 		List<RegionOverride> normalized = new ArrayList<>();
 		for (int i = 0; i < overrides.size(); i++)
 		{
@@ -389,6 +575,7 @@ public class GpuSkyExtensionPlugin extends Plugin
 		loadedOverridesJson = json;
 		regionOverrides = Collections.unmodifiableList(normalized);
 		requestAssetRefresh();
+		return true;
 	}
 
 	private RegionOverride createRegionOverride(String name)
@@ -403,7 +590,12 @@ public class GpuSkyExtensionPlugin extends Plugin
 		return override.normalized(index);
 	}
 
-	CompletableFuture<String> importSkybox(Filepath selected, String overrideId)
+	/**
+	 * Imports a panorama and assigns it to the override by ID. The assignment is made here,
+	 * not by the editor that started it, so a panel rebuilt in the meantime cannot lose it;
+	 * it is skipped (with an error) if the profile changed during the import.
+	 */
+	CompletableFuture<String> importSkybox(Filepath selected, String overrideId, long expectedProfile)
 	{
 		AssetLoadSession session = loadSession;
 		ScheduledExecutorService currentLoader = loader;
@@ -417,14 +609,22 @@ public class GpuSkyExtensionPlugin extends Plugin
 			return CompletableFuture.supplyAsync(() ->
 			{
 				session.checkActive();
+				String path;
 				try
 				{
-					return importSkybox(selected, overrideId, maxWidth, session);
+					path = importSkybox(selected, overrideId, maxWidth, session);
 				}
 				catch (IOException ex)
 				{
 					throw new CompletionException(ex);
 				}
+				session.checkActive();
+				if (!updateRegionOverride(overrideId, expectedProfile, override -> override.skyboxFile = path))
+				{
+					throw new CompletionException(new IOException("The image was saved as " + path
+						+ ", but not assigned: the profile or the override changed while it was importing."));
+				}
+				return path;
 			}, currentLoader);
 		}
 		catch (RejectedExecutionException ex)
@@ -436,7 +636,7 @@ public class GpuSkyExtensionPlugin extends Plugin
 	private String importSkybox(Filepath selected, String overrideId, int maxWidth, AssetLoadSession session)
 		throws IOException
 	{
-		ImageLoader.validate(selected, maxWidth);
+		ImageLoader.validatePanorama(selected, maxWidth);
 		Filepath overrideDirectory = ensureSkyboxDirectory().joinSegment("overrides");
 		overrideDirectory.createDirectories();
 		String fileName = selected.getFileName().replaceAll("[^A-Za-z0-9._-]", "_");
@@ -447,7 +647,7 @@ public class GpuSkyExtensionPlugin extends Plugin
 		try
 		{
 			selected.copyTo(temporary, StandardCopyOption.REPLACE_EXISTING);
-			ImageLoader.read(temporary, maxWidth, 8);
+			ImageLoader.readPanorama(temporary, maxWidth, message -> { });
 			session.checkActive();
 			try
 			{
@@ -485,7 +685,16 @@ public class GpuSkyExtensionPlugin extends Plugin
 				Filepath directory = getPluginDirectory();
 				directory.createDirectories();
 				// Presets and weather textures ship with the plugin; add any that are missing.
-				BundledAssets.install(directory);
+				boolean complete = BundledAssets.install(directory);
+				if (!complete && Thread.currentThread().isInterrupted())
+				{
+					// The plugin is stopping mid-copy: the next start installs the rest.
+					throw new CancellationException("Bundled asset installation interrupted");
+				}
+				if (!complete && ++installFailures < MAX_INSTALL_ATTEMPTS)
+				{
+					throw new IOException("Some bundled assets could not be installed; trying again");
+				}
 				skyboxDirectory = directory;
 			}
 			return skyboxDirectory;
@@ -545,6 +754,9 @@ public class GpuSkyExtensionPlugin extends Plugin
 	protected void shutDown()
 	{
 		lifecycle.incrementAndGet();
+		TextureQualitySetup currentSetup = textureQualitySetup;
+		textureQualitySetup = null;
+		if (currentSetup != null) currentSetup.close();
 		WaterFeature currentWater = water;
 		water = null;
 		if (currentWater != null)
@@ -580,17 +792,37 @@ public class GpuSkyExtensionPlugin extends Plugin
 			loader = null;
 		}
 		GpuSkyExtension currentExtension = extension;
-		boolean currentExtensionRegistered = extensionRegistered;
 		extension = null;
-		extensionRegistered = false;
 		if (currentExtension != null)
 		{
+			// Decided on the client thread, where registration happens, so a registration
+			// that is still pending is cancelled by its lifecycle check and one that already
+			// ran is always seen here.
 			clientThread.invokeLater(() ->
 			{
 				currentExtension.close();
-				if (currentExtensionRegistered)
+				if (registeredExtension != currentExtension)
+				{
+					return;
+				}
+				registeredExtension = null;
+				// Same readiness test as registration: with the GPU plugin off (even if another
+				// renderer is drawing), unregistering would queue a recompile in the wrong context.
+				if (canRegisterWithGpu(gpuPluginActive(), client.isGpu(), client.getDrawCallbacks()))
 				{
 					gpuApi.unregisterExtension(this, currentExtension);
+				}
+				else
+				{
+					// unregisterExtension queues a shader recompile, and the API does not check
+					// that its GL context still exists when that task runs. With GPU already
+					// stopped it would call GL without a context, so leave this closed (inert)
+					// extension registered and unregister it on the next startup that finds
+					// GPU running. PARTIAL MITIGATION: if GPU stops after this check but before
+					// the queued recompile runs (within about one client tick), the API can
+					// still recompile without a context. The complete fix is a context check
+					// inside the API's recompile task (to raise with Adam; API left unchanged).
+					staleExtensions.add(currentExtension);
 				}
 			});
 		}
@@ -627,9 +859,9 @@ public class GpuSkyExtensionPlugin extends Plugin
 	private void refreshRegionContext()
 	{
 		GameState state = client.getGameState();
-		Player player = client.getLocalPlayer();
-		int nextRegionId = state != GameState.LOGGED_IN || player == null ? -1
-			: WorldPoint.fromLocalInstance(client, player.getLocalLocation()).getRegionID();
+		// Main-world position: on a boat this is the sea region, not the boat's own.
+		LocalPoint local = state == GameState.LOGGED_IN ? MainWorldLocation.ofPlayer(client) : null;
+		int nextRegionId = local == null ? -1 : WorldPoint.fromLocalInstance(client, local).getRegionID();
 		boolean nextInChambersOfXeric = nextRegionId >= 0
 			&& client.getVarbitValue(VarbitID.RAIDS_CLIENT_INDUNGEON) == 1;
 		RegionContext previous = regionContext;
@@ -671,6 +903,28 @@ public class GpuSkyExtensionPlugin extends Plugin
 	}
 
 	@Subscribe
+	public void onProfileChanged(ProfileChanged event)
+	{
+		AssetLoadSession session = loadSession;
+		if (session == null) return;
+		resumeLoading();
+		// Load the new profile's overrides now, before any panel edit can save the old list into it.
+		reloadOverridesForProfile();
+		// Before the chooser reads the resolution: a profile from the old 8K checkbox keeps its 8K choice.
+		migrateTextureResolution();
+		resetTextureQualitySetup();
+		session.cancelUploads();
+		refreshLoadingOverlay();
+		requestAssetRefresh();
+	}
+
+	private synchronized void reloadOverridesForProfile()
+	{
+		loadedOverridesJson = null;
+		refreshRegionOverrides();
+	}
+
+	@Subscribe
 	public void onConfigChanged(ConfigChanged event)
 	{
 		if (extension != null) extension.invalidateFloorPresence();
@@ -678,6 +932,7 @@ public class GpuSkyExtensionPlugin extends Plugin
 		{
 			return;
 		}
+		resumeLoading();
 		if (WaterFeature.KEYS.contains(event.getKey()))
 		{
 			// Water settings are read live each frame; no skybox reload. If one was
@@ -690,6 +945,10 @@ public class GpuSkyExtensionPlugin extends Plugin
 		}
 
 		requestAssetRefresh();
+		if ("textureResolution".equals(event.getKey()))
+		{
+			resolutionReducedForMemory = false;
+		}
 		if ("textureResolution".equals(event.getKey()) || "preloadSkyboxPresets".equals(event.getKey()))
 		{
 			AssetLoadSession session = loadSession;
@@ -702,10 +961,97 @@ public class GpuSkyExtensionPlugin extends Plugin
 		}
 	}
 
+	/**
+	 * One loader pass that can never end the once-a-second schedule. After an out-of-memory
+	 * error nothing heavy is retried: loading stays paused until a deliberate trigger (a
+	 * setting of this plugin changes, a profile switch, a GPU restart, or the plugin restarts).
+	 * Any other Error stops loading for this plugin start.
+	 */
+	private void poll(AssetLoadSession session)
+	{
+		if (session.stopped)
+		{
+			return;
+		}
+		if (session.memoryBlocked)
+		{
+			refreshLoadingOverlay(); // Lets the notice time out.
+			return;
+		}
+		try
+		{
+			pollFilesAndConfig(session);
+		}
+		catch (OutOfMemoryError error)
+		{
+			session.memoryBlocked = true;
+			abandonLoads(session);
+			memoryNoticeUntil = System.nanoTime() + MEMORY_NOTICE_NANOS;
+			log.warn("Skybox for GPU ran out of memory while loading and has paused loading. Lower the texture "
+				+ "resolution or raise RuneLite's memory limit; loading resumes when a Skybox setting changes "
+				+ "or the plugin is restarted.", error);
+			refreshLoadingOverlay();
+		}
+		catch (RuntimeException ex)
+		{
+			log.debug("Skybox asset refresh failed", ex);
+		}
+		catch (Error error)
+		{
+			if (error instanceof ThreadDeath)
+			{
+				throw error;
+			}
+			session.stopped = true;
+			abandonLoads(session);
+			log.error("Skybox for GPU stopped loading after an unexpected error; restart the plugin to retry", error);
+		}
+	}
+
+	/** Releases anything waiting on the failed pass, so neither the client nor a weather effect stays stuck. */
+	private static void abandonLoads(AssetLoadSession session)
+	{
+		session.cancelUploads();
+		for (WeatherLoadState state : session.weather.values())
+		{
+			state.retryNow();
+		}
+	}
+
+	/** A deliberate trigger after an out-of-memory pause: try loading again, once. */
+	private void resumeLoading()
+	{
+		AssetLoadSession session = loadSession;
+		if (session != null && session.memoryBlocked)
+		{
+			session.memoryBlocked = false;
+			memoryNoticeUntil = 0;
+		}
+	}
+
+	/** Loading is paused after running out of memory, and the notice about it is still due. */
+	boolean memoryNoticeDue()
+	{
+		AssetLoadSession session = loadSession;
+		return session != null && session.memoryBlocked && System.nanoTime() - memoryNoticeUntil < 0;
+	}
+
 	private void pollFilesAndConfig(AssetLoadSession session)
 	{
 		if (session != loadSession) return;
 		refreshStage(session, "asset directory", this::ensureSkyboxDirectory);
+		if (session != loadSession) return;
+		// Before the texture-chooser gate: a new profile shows the chooser, and its
+		// overrides must still be loaded while it waits.
+		refreshStage(session, "region overrides", () -> session.publish(this::refreshRegionOverrides));
+		if (session != loadSession) return;
+		TextureQualitySetup setup = textureQualitySetup;
+		if (setup != null && setup.isPending())
+		{
+			setup.prepare(skyboxDirectory);
+			return;
+		}
+		if (setup != textureQualitySetup) return;
 		if (skyboxDirectory == null)
 		{
 			return;
@@ -797,7 +1143,7 @@ public class GpuSkyExtensionPlugin extends Plugin
 			}
 		}
 		String nextSignature = mode + signatures;
-		if (nextSignature.equals(session.preloadSignature))
+		if (nextSignature.equals(session.preloadSignature) && !session.images.retryDue())
 		{
 			return;
 		}
@@ -879,7 +1225,7 @@ public class GpuSkyExtensionPlugin extends Plugin
 			currentLoader.execute(() ->
 			{
 				session.refreshQueued.set(false);
-				pollFilesAndConfig(session);
+				poll(session);
 			});
 		}
 		catch (RejectedExecutionException ex)
@@ -898,6 +1244,7 @@ public class GpuSkyExtensionPlugin extends Plugin
 		List<RegionOverride> overrides = regionOverrides;
 		boolean overridesDisabled = config.disableRegionOverrides();
 		RegionOverride activeOverride = activeRegionOverride(context, overrides, overridesDisabled);
+		TfaRoomSettings roomSettings = TfaRoomSettings.resolve(activeOverride, context.regionId);
 		boolean mainSkyboxDisabled = config.skyboxImage() == GpuSkyExtensionConfig.SkyboxImage.DISABLED;
 		String customOverworld = mainSkyboxDisabled ? "" : trim(config.skyboxFile());
 		String overworld = customOverworld;
@@ -931,7 +1278,8 @@ public class GpuSkyExtensionPlugin extends Plugin
 		}
 		String signature = safeFileSignature(overworld) + '|' + safeFileSignature(cave) + '|' + safeFileSignature(region)
 			+ "|res=" + maxWidth;
-		boolean imagesChanged = !signature.equals(session.skyboxSignature);
+		// Also when a sky that failed to load or upload is due for one of its few retries.
+		boolean imagesChanged = !signature.equals(session.skyboxSignature) || session.images.retryDue();
 		SkyboxAsset overworldImage = null;
 		SkyboxAsset caveImage = null;
 		SkyboxAsset regionImage = null;
@@ -956,7 +1304,7 @@ public class GpuSkyExtensionPlugin extends Plugin
 				+ '|' + activeOverride.inheritLightSettings + '|' + activeOverride.worldLighting
 				+ '|' + activeOverride.rimLighting + '|' + activeOverride.backlighting
 				+ '|' + activeOverride.skyboxTint + '|' + activeOverride.atmosphere
-				+ '|' + trim(activeOverride.waterColor);
+				+ '|' + trim(activeOverride.waterColor) + '|' + roomSettings;
 		boolean regionStateChanged = !regionState.equals(session.regionState);
 		boolean weatherChanged = mainWeather != session.publishedMainWeather;
 		if (!imagesChanged && !regionStateChanged && !weatherChanged)
@@ -1010,7 +1358,7 @@ public class GpuSkyExtensionPlugin extends Plugin
 					}
 					current.setRegionOverride(activeOverride != null, weather, intensity, disableRegionSkybox,
 						inheritSkySettings, horizontalFov, yawOffset, pitchOffset, exposure, inheritLightSettings,
-						worldLighting, rimLighting, backlighting, skyboxTint, atmosphere);
+						worldLighting, rimLighting, backlighting, skyboxTint, atmosphere, roomSettings);
 					// Same moment as the skybox: the water color then fades with the sky.
 					publishedRegionWaterColor = regionWaterColor;
 					publication.complete(true);
@@ -1073,11 +1421,17 @@ public class GpuSkyExtensionPlugin extends Plugin
 
 	boolean isLoadingSkyboxTextures()
 	{
+		TextureQualitySetup setup = textureQualitySetup;
+		if (setup != null && setup.isPending()) return false;
 		return isLoadingEightKPresets() || isLoadingFourKPresets();
 	}
 
 	PreloadStatus preloadStatus()
 	{
+		if (memoryNoticeDue())
+		{
+			return PreloadStatus.OUT_OF_MEMORY;
+		}
 		GpuSkyExtension current = extension;
 		return preloadStatus(isLoadingSkyboxTextures(), current != null && current.hasContext());
 	}
@@ -1089,7 +1443,7 @@ public class GpuSkyExtensionPlugin extends Plugin
 
 	enum PreloadStatus
 	{
-		IDLE, WAITING_FOR_GPU, LOADING
+		IDLE, WAITING_FOR_GPU, LOADING, OUT_OF_MEMORY
 	}
 
 	private void beginEightKPreload()
@@ -1127,9 +1481,13 @@ public class GpuSkyExtensionPlugin extends Plugin
 
 	private void onGpuContextChanged()
 	{
+		resumeLoading();
 		AssetLoadSession session = loadSession;
 		if (session != null)
 		{
+			// Uploaded weather pixels were released; the new context needs them decoded again.
+			session.weatherSprites.contextLost();
+			session.weatherContext.incrementAndGet();
 			session.cancelUploads();
 			requestAssetRefresh();
 		}
@@ -1138,10 +1496,10 @@ public class GpuSkyExtensionPlugin extends Plugin
 		refreshLoadingOverlay();
 	}
 
-	private SkyboxAsset uploadSkybox(AssetLoadSession session, BufferedImage image) throws IOException
+	private SkyboxAsset uploadSkybox(AssetLoadSession session, BufferedImage image, String file) throws IOException
 	{
 		session.checkActive();
-		SkyboxAsset asset = new SkyboxAsset(image);
+		SkyboxAsset asset = new SkyboxAsset(image, file);
 		SkyboxUploadBatch batch = session.uploads;
 		if (batch == null)
 		{
@@ -1200,7 +1558,7 @@ public class GpuSkyExtensionPlugin extends Plugin
 			{
 				BufferedImage loaded = readImage(configured, label, bundledFallback, maxWidth);
 				session.checkActive();
-				return loaded == null ? null : uploadSkybox(session, loaded);
+				return loaded == null ? null : uploadSkybox(session, loaded, configured);
 			}
 			catch (RuntimeException ex)
 			{
@@ -1295,11 +1653,13 @@ public class GpuSkyExtensionPlugin extends Plugin
 		{
 			requested.add(GpuSkyExtensionConfig.WeatherEffect.MOONLIGHT);
 		}
+		// Galaxy is drawn in the sky shader and needs no particle asset loading.
+		requested.remove(GpuSkyExtensionConfig.WeatherEffect.GALAXY);
 		for (GpuSkyExtensionConfig.WeatherEffect effect : requested)
 		{
 			session.checkActive();
 			WeatherLoadState state = session.weather.computeIfAbsent(effect, key -> new WeatherLoadState());
-			if (!state.begin(System.nanoTime()))
+			if (!state.begin(System.nanoTime(), session.weatherContext.get()))
 			{
 				continue;
 			}
@@ -1320,7 +1680,7 @@ public class GpuSkyExtensionPlugin extends Plugin
 				Filepath directory = weatherDirectory.joinSegment(assetDirectory);
 				Filepath sharedDirectory = weatherDirectory.joinSegment("shared");
 				WeatherRenderer.LoadedWeatherAssets assets =
-					WeatherRenderer.loadAssets(effect, directory, sharedDirectory, state.assets);
+					WeatherRenderer.loadAssets(effect, directory, sharedDirectory, state.assets, session.weatherSprites);
 				state.assets = assets;
 				session.checkActive();
 				clientThread.invokeLater(() -> session.publish(() ->
@@ -1328,9 +1688,27 @@ public class GpuSkyExtensionPlugin extends Plugin
 					GpuSkyExtension current = extension;
 					if (current != null && session == loadSession)
 					{
-						current.uploadWeather(assets, success -> state.finish(success, System.nanoTime()));
+						current.uploadWeather(assets, success ->
+						{
+							if (!success && assets.foundStale())
+							{
+								// Loaded just before a GPU context change: decode again now, without the backoff.
+								state.retryNow();
+								requestAssetRefresh();
+							}
+							else
+							{
+								state.finish(success, System.nanoTime());
+							}
+						});
 					}
 				}));
+			}
+			catch (Error error)
+			{
+				// Never leave the effect marked as loading; poll() decides what happens next.
+				state.retryNow();
+				throw error;
 			}
 			catch (RuntimeException ex)
 			{
@@ -1356,7 +1734,7 @@ public class GpuSkyExtensionPlugin extends Plugin
 			}
 			return bundledFallback ? readFallbackSkybox(maxWidth) : null;
 		}
-		BufferedImage image = ImageLoader.read(path, maxWidth, 8);
+		BufferedImage image = ImageLoader.readPanorama(path, maxWidth, this::noteReducedResolution);
 		if (image == null)
 		{
 			log.warn("Unable to decode {} skybox {}", label, path);
@@ -1374,13 +1752,33 @@ public class GpuSkyExtensionPlugin extends Plugin
 			log.warn("Fallback skybox is missing: {}", FALLBACK_SKYBOX);
 			return null;
 		}
-		BufferedImage image = ImageLoader.read(path, maxWidth, 8);
+		BufferedImage image = ImageLoader.readPanorama(path, maxWidth, this::noteReducedResolution);
 		if (image == null)
 		{
 			throw new IOException("Unable to decode fallback skybox " + path);
 		}
 		log.debug("Loaded fallback skybox {} {}x{}", path, image.getWidth(), image.getHeight());
 		return image;
+	}
+
+	/** Logs once per file and resolution, and tells the loading overlay to explain the reduced quality. */
+	private void noteReducedResolution(String message)
+	{
+		if (reducedResolutionWarnings.add(message))
+		{
+			log.warn("{}. Raise RuneLite's memory limit to load it at full size.", message);
+		}
+		if (!resolutionReducedForMemory)
+		{
+			resolutionReducedForMemory = true;
+			refreshLoadingOverlay();
+		}
+	}
+
+	/** A panorama is shown below the selected resolution because of the memory limit. */
+	boolean resolutionReducedForMemory()
+	{
+		return resolutionReducedForMemory;
 	}
 
 	private String fileSignature(String configured) throws IOException

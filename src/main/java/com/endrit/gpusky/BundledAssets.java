@@ -30,11 +30,18 @@ final class BundledAssets
 	}
 
 	/** Copies every bundled asset that is missing from {@code directory}. Asset-worker thread only. */
-	static void install(Filepath directory)
+	/** Returns whether every listed asset is now present; false after a failed or interrupted copy. */
+	static boolean install(Filepath directory)
 	{
 		int copied = 0;
+		boolean complete = true;
 		for (String relative : index())
 		{
+			if (Thread.currentThread().isInterrupted())
+			{
+				// The plugin is stopping; copying on would only fail file by file.
+				return false;
+			}
 			try
 			{
 				Filepath target = directory;
@@ -70,10 +77,16 @@ final class BundledAssets
 			}
 			catch (IOException | RuntimeException ex)
 			{
+				complete = false;
+				if (Thread.currentThread().isInterrupted())
+				{
+					return false;
+				}
 				log.warn("Unable to install bundled skybox asset {}", relative, ex);
 			}
 		}
 		if (copied > 0) log.info("Installed {} bundled skybox/weather assets", copied);
+		return complete;
 	}
 
 	private static List<String> index()

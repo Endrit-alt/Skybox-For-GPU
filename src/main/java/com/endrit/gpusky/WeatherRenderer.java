@@ -29,8 +29,10 @@ import java.awt.Graphics2D;
 import java.awt.image.BufferedImage;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.EnumMap;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -97,11 +99,25 @@ class WeatherRenderer
 		"}");
 
 	private static final int VERTEX_FLOATS = OpenGlContext.VERTEX_STRIDE_FLOATS;
+	// Not unit 0: that is gpuSkyCurrent, which the scene shader samples on the next frame.
+	private static final int WEATHER_TEXTURE_UNIT = 6;
 	private static final int MAX_PARTICLES_PER_LAYER = 16384;
-	private static final int MAX_PARTICLE_VERTICES = 18;
-	private static final int MAX_VERTICES = MAX_PARTICLES_PER_LAYER * MAX_PARTICLE_VERTICES;
 	private static final int MAX_BEAM_COLUMNS = 6;
 	private static final int MAX_BEAM_ROWS = 8;
+	/**
+	 * Most vertices one particle can write: a terrain-following beam grid (6 per cell), else
+	 * 18 for a soft-volume billboard. Space for this much is reserved before every particle.
+	 * A new geometry path that writes more must raise this.
+	 */
+	static final int MAX_VERTICES_PER_PARTICLE = Math.max(18, MAX_BEAM_COLUMNS * MAX_BEAM_ROWS * 6);
+	/** First allocation, made at the first weather draw (not at plugin start). */
+	static final int INITIAL_BATCH_VERTICES = 16_384;
+	/**
+	 * A layer's vertices are drawn in batches of at most this many. The largest layer today
+	 * writes about 62,400, so it stays one draw; past this the batch is drawn and the next one
+	 * started, in the same particle order and with the same state, so it looks the same.
+	 */
+	static final int MAX_BATCH_VERTICES = 131_072;
 	private static final int BEAM_PROXIMITY_COLUMNS = 4;
 	private static final int BEAM_PROXIMITY_ROWS = 6;
 	private static final int ATLAS_PADDING = 2;
@@ -118,7 +134,8 @@ class WeatherRenderer
 	private static final float BEAM_EDGE_HIDDEN_FACING = 0.04f;
 	private static final float BEAM_EDGE_FULL_FACING = 0.20f;
 
-	private final float[] vertexBuffer = new float[MAX_VERTICES * VERTEX_FLOATS];
+	// Grows on demand up to MAX_BATCH_VERTICES (about 6.8 MB); empty until weather draws.
+	private float[] vertexBuffer = new float[0];
 	private final float[] beamRowX0 = new float[MAX_BEAM_COLUMNS + 1];
 	private final float[] beamRowY0 = new float[MAX_BEAM_COLUMNS + 1];
 	private final float[] beamRowZ0 = new float[MAX_BEAM_COLUMNS + 1];
@@ -128,7 +145,9 @@ class WeatherRenderer
 	private final float[] beamRowZ1 = new float[MAX_BEAM_COLUMNS + 1];
 	private final float[] beamRowAlpha1 = new float[MAX_BEAM_COLUMNS + 1];
 	private final EnumMap<Layer, SpriteSet> spriteSets = new EnumMap<>(Layer.class);
-	private final EnumMap<Layer, LoadedSpriteSet> uploadedAssets = new EnumMap<>(Layer.class);
+	// Client thread. Layers that load the same frames with the same processing share one texture.
+	private final EnumMap<Layer, String> layerKeys = new EnumMap<>(Layer.class);
+	private final Map<String, SharedTexture> sharedTextures = new HashMap<>();
 	private final EnumMap<Layer, WeatherParticle[]> particles = new EnumMap<>(Layer.class);
 	private final EnumMap<Layer, Integer> triggeredParticleIndices = new EnumMap<>(Layer.class);
 	private final Random random = new Random(0x51A0CC0L);
@@ -145,6 +164,10 @@ class WeatherRenderer
 	private float moonlightDirectionY = -1f;
 	private float moonlightDirectionZ;
 	private float lightWeatherOpacity = 1f;
+	// Colour of the sky's light that the beams come from (Sunlight and Moonlight).
+	private float lightRed = 1f;
+	private float lightGreen = 1f;
+	private float lightBlue = 1f;
 
 	void start(OpenGlContext gpu)
 	{
@@ -156,6 +179,7 @@ class WeatherRenderer
 	void stop()
 	{
 		shutdownTextures();
+		vertexBuffer = new float[0];
 		gpu = null;
 		program = 0;
 		buffer = 0;
@@ -164,7 +188,8 @@ class WeatherRenderer
 	void shutdownTextures()
 	{
 		spriteSets.clear();
-		uploadedAssets.clear();
+		layerKeys.clear();
+		sharedTextures.clear(); // Deleted with the GL context that owns them.
 		particles.clear();
 		triggeredParticleIndices.clear();
 		lastFrameNanos = 0;
@@ -174,10 +199,24 @@ class WeatherRenderer
 	static LoadedWeatherAssets loadAssets(GpuSkyExtensionConfig.WeatherEffect weatherEffect, Filepath directory,
 		Filepath sharedDirectory, LoadedWeatherAssets previous)
 	{
+		return loadAssets(weatherEffect, directory, sharedDirectory, previous, new SpriteCache());
+	}
+
+	/** {@code cache} (one per loader session) makes layers and effects that use the same frames share one decode. */
+	static LoadedWeatherAssets loadAssets(GpuSkyExtensionConfig.WeatherEffect weatherEffect, Filepath directory,
+		Filepath sharedDirectory, LoadedWeatherAssets previous, SpriteCache cache)
+	{
 		LoadedWeatherAssets assets = new LoadedWeatherAssets(weatherEffect);
 		if (previous != null)
 		{
-			assets.spriteSets.putAll(previous.spriteSets);
+			for (Map.Entry<Layer, LoadedSpriteSet> entry : previous.spriteSets.entrySet())
+			{
+				// A stale set's pixels are gone with an old GPU context: decode it again.
+				if (!entry.getValue().stale)
+				{
+					assets.spriteSets.put(entry.getKey(), entry.getValue());
+				}
+			}
 		}
 		for (Layer layer : Layer.values())
 		{
@@ -191,7 +230,7 @@ class WeatherRenderer
 			}
 			try
 			{
-				LoadedSpriteSet spriteSet = loadSpriteSet(directory, sharedDirectory, layer);
+				LoadedSpriteSet spriteSet = loadSpriteSet(directory, sharedDirectory, layer, cache);
 				if (spriteSet != null)
 				{
 					assets.spriteSets.put(layer, spriteSet);
@@ -231,25 +270,40 @@ class WeatherRenderer
 	boolean upload(LoadedWeatherAssets assets)
 	{
 		boolean complete = assets.complete;
+		List<LoadedSpriteSet> uploaded = new ArrayList<>();
 		for (Map.Entry<Layer, LoadedSpriteSet> entry : assets.spriteSets.entrySet())
 		{
 			Layer layer = entry.getKey();
 			LoadedSpriteSet loaded = entry.getValue();
-			if (uploadedAssets.get(layer) == loaded)
+			if (java.util.Objects.equals(loaded.key, layerKeys.get(layer)) && spriteSets.containsKey(layer))
 			{
 				continue;
 			}
 			try
 			{
-				int texture = gpu.createTexture(loaded.atlas, OpenGlContext.Wrap.CLAMP, OpenGlContext.Wrap.CLAMP,
-					OpenGlContext.Filter.LINEAR, OpenGlContext.TextureOrigin.TOP_LEFT);
-				SpriteSet previous = spriteSets.put(layer,
-					new SpriteSet(texture, loaded.frames, loaded.displayWidth, loaded.displayHeight));
-				uploadedAssets.put(layer, loaded);
-				if (previous != null)
+				SharedTexture shared = sharedTextures.get(loaded.key);
+				if (shared == null)
 				{
-					gpu.destroyTexture(previous.texture);
+					BufferedImage atlas = loaded.atlas;
+					if (atlas == null)
+					{
+						// Its pixels were released after an earlier upload, and that texture is gone.
+						loaded.stale = true;
+						assets.foundStale = true;
+						complete = false;
+						continue;
+					}
+					int texture = gpu.createTexture(atlas, OpenGlContext.Wrap.CLAMP, OpenGlContext.Wrap.CLAMP,
+						OpenGlContext.Filter.LINEAR, OpenGlContext.TextureOrigin.TOP_LEFT);
+					shared = new SharedTexture(texture);
+					sharedTextures.put(loaded.key, shared);
+					uploaded.add(loaded);
 				}
+				// Count the new user before releasing the old one, so a shared texture is never deleted in use.
+				shared.users++;
+				releaseLayer(layer);
+				spriteSets.put(layer, new SpriteSet(shared.texture, loaded.frames, loaded.displayWidth, loaded.displayHeight));
+				layerKeys.put(layer, loaded.key);
 				log.debug("Loaded {} weather frames for {}", loaded.frames.length, layer.assetPrefix);
 			}
 			catch (RuntimeException ex)
@@ -258,7 +312,31 @@ class WeatherRenderer
 				log.debug("Unable to upload weather layer {}; will retry", layer, ex);
 			}
 		}
+		// The pixels now live on the GPU. After a GPU restart the loader decodes them again.
+		for (LoadedSpriteSet set : uploaded)
+		{
+			set.atlas = null;
+		}
 		return complete;
+	}
+
+	/** Drops a layer's texture use; the texture is deleted once no layer uses it. */
+	private void releaseLayer(Layer layer)
+	{
+		String key = layerKeys.remove(layer);
+		spriteSets.remove(layer);
+		SharedTexture shared = key == null ? null : sharedTextures.get(key);
+		if (shared != null && --shared.users <= 0)
+		{
+			sharedTextures.remove(key);
+			gpu.destroyTexture(shared.texture);
+		}
+	}
+
+	/** Number of distinct weather textures on the GPU, for tests and logging. */
+	int textureCount()
+	{
+		return sharedTextures.size();
 	}
 
 	boolean activate(GpuSkyExtensionConfig.WeatherEffect effect)
@@ -282,7 +360,8 @@ class WeatherRenderer
 	void draw(GpuSkyExtensionConfig.WeatherEffect weatherEffect, int viewportWidth, int viewportHeight, int intensityPercent,
 		float cameraX, float cameraY, float cameraZ, float cameraYaw, float cameraPitch,
 		float anchorX, float anchorZ, Scene scene, byte[][][] tileSettings, int plane,
-		float moonDirectionX, float moonDirectionY, float moonDirectionZ, float lightWeatherOpacity)
+		float moonDirectionX, float moonDirectionY, float moonDirectionZ, float lightWeatherOpacity,
+		float lightRed, float lightGreen, float lightBlue)
 	{
 		if (gpu == null || program == 0 || buffer == 0 || spriteSets.isEmpty() || activeEffect != weatherEffect
 			|| viewportWidth <= 0 || viewportHeight <= 0)
@@ -290,13 +369,19 @@ class WeatherRenderer
 			return;
 		}
 
-		float intensity = Math.max(0f, Math.min(2f, intensityPercent / 100f));
+		float intensity = LightBeams.weatherIntensity(usesMoonlightLayers(weatherEffect), intensityPercent);
 		if (intensity <= 0f)
 		{
 			return;
 		}
 		setMoonlightDirection(moonDirectionX, moonDirectionY, moonDirectionZ);
 		this.lightWeatherOpacity = lightWeatherOpacity;
+		float[] beamColor = weatherEffect == GpuSkyExtensionConfig.WeatherEffect.SUNLIGHT
+			? LightBeams.sunlightColor(lightRed, lightGreen, lightBlue)
+			: new float[]{lightRed, lightGreen, lightBlue};
+		this.lightRed = beamColor[0];
+		this.lightGreen = beamColor[1];
+		this.lightBlue = beamColor[2];
 
 		float anchorGroundHeight = anchoredGroundHeight(scene, plane, anchorX, anchorZ, cameraX, cameraZ);
 		float anchorGroundDelta = Float.isNaN(lastAnchorGroundHeight) ? 0f : anchorGroundHeight - lastAnchorGroundHeight;
@@ -360,17 +445,57 @@ class WeatherRenderer
 				scene, tileSettings, plane, deltaSeconds);
 			if (particle.active)
 			{
+				vertices = reserveParticle(layer, spriteSet, vertices);
 				vertices += putParticle(layer, spriteSet, particle, screenBillboard, cameraX, cameraY, cameraZ,
 					anchorGroundHeight, scene, plane);
 			}
 		}
+		drawBatch(layer, spriteSet, vertices);
+	}
+
+	/**
+	 * Makes room for one more particle's worst case (MAX_VERTICES_PER_PARTICLE) after the
+	 * {@code vertices} already written: grows the array, or, at MAX_BATCH_VERTICES, draws the
+	 * batch so far and starts a new one. Returns the vertex count to continue from.
+	 */
+	private int reserveParticle(Layer layer, SpriteSet spriteSet, int vertices)
+	{
+		// From the write position itself, so the bound holds even if a count were off.
+		int needed = vertexOffset / VERTEX_FLOATS + MAX_VERTICES_PER_PARTICLE;
+		if ((long) needed * VERTEX_FLOATS <= vertexBuffer.length)
+		{
+			return vertices;
+		}
+		int capacity = batchCapacity(vertexBuffer.length / VERTEX_FLOATS, needed);
+		if (capacity >= needed)
+		{
+			vertexBuffer = Arrays.copyOf(vertexBuffer, capacity * VERTEX_FLOATS);
+			return vertices;
+		}
+		drawBatch(layer, spriteSet, vertices);
+		vertexOffset = 0;
+		return 0;
+	}
+
+	/** Next array size in vertices: doubling from INITIAL_BATCH_VERTICES, never past MAX_BATCH_VERTICES. */
+	static int batchCapacity(int current, int needed)
+	{
+		int capacity = Math.max(INITIAL_BATCH_VERTICES, current);
+		while (capacity < needed && capacity < MAX_BATCH_VERTICES)
+		{
+			capacity = Math.min(MAX_BATCH_VERTICES, capacity * 2);
+		}
+		return capacity;
+	}
+
+	private void drawBatch(Layer layer, SpriteSet spriteSet, int vertices)
+	{
 		if (vertices == 0)
 		{
 			return;
 		}
-
 		gpu.useProgram(program);
-		gpu.bindTexture("weatherTexture", spriteSet.texture, 0);
+		gpu.bindTexture("weatherTexture", spriteSet.texture, WEATHER_TEXTURE_UNIT);
 		gpu.uniform1f("tintStrength", layer.tintStrength());
 		gpu.upload(buffer, vertexBuffer, vertices);
 		gpu.draw(buffer, 0, vertices, layer.depth(), OpenGlContext.Blend.ALPHA);
@@ -420,20 +545,12 @@ class WeatherRenderer
 			WeatherParticle particle = layerParticles[i];
 			if (particle.active)
 			{
+				vertices = reserveParticle(layer, spriteSet, vertices);
 				vertices += putParticle(layer, spriteSet, particle, screenBillboard, cameraX, cameraY, cameraZ,
 					anchorGroundHeight, scene, plane);
 			}
 		}
-		if (vertices == 0)
-		{
-			return;
-		}
-
-		gpu.useProgram(program);
-		gpu.bindTexture("weatherTexture", spriteSet.texture, 0);
-		gpu.uniform1f("tintStrength", layer.tintStrength());
-		gpu.upload(buffer, vertexBuffer, vertices);
-		gpu.draw(buffer, 0, vertices, layer.depth(), OpenGlContext.Blend.ALPHA);
+		drawBatch(layer, spriteSet, vertices);
 	}
 
 	private int putParticle(Layer layer, SpriteSet spriteSet, WeatherParticle particle,
@@ -1006,7 +1123,8 @@ class WeatherRenderer
 		{
 			return FALL_LEAF_BRIGHTNESS;
 		}
-		return activeEffect == GpuSkyExtensionConfig.WeatherEffect.SUNLIGHT && layer.moonlightLayer() ? 1f : layer.red;
+		// Sunlight and Moonlight take the colour of the sky's light they come from.
+		return layer.moonlightLayer() ? lightRed : layer.red;
 	}
 
 	private float layerGreen(Layer layer)
@@ -1015,7 +1133,7 @@ class WeatherRenderer
 		{
 			return 0.42f * FALL_LEAF_BRIGHTNESS;
 		}
-		return activeEffect == GpuSkyExtensionConfig.WeatherEffect.SUNLIGHT && layer.moonlightLayer() ? 0.84f : layer.green;
+		return layer.moonlightLayer() ? lightGreen : layer.green;
 	}
 
 	private float layerBlue(Layer layer)
@@ -1024,7 +1142,7 @@ class WeatherRenderer
 		{
 			return 0.08f * FALL_LEAF_BRIGHTNESS;
 		}
-		return activeEffect == GpuSkyExtensionConfig.WeatherEffect.SUNLIGHT && layer.moonlightLayer() ? 0.38f : layer.blue;
+		return layer.moonlightLayer() ? lightBlue : layer.blue;
 	}
 
 	private boolean isFallLeaf(Layer layer)
@@ -1258,7 +1376,9 @@ class WeatherRenderer
 				continue;
 			}
 
-			WeatherParticle[] layerParticles = new WeatherParticle[layer.baseCount * 2];
+			// Room for the highest intensity: 200%, which Sunlight/Moonlight count double.
+			WeatherParticle[] layerParticles = new WeatherParticle[Math.round(layer.baseCount
+				* LightBeams.weatherIntensity(usesMoonlightLayers(activeEffect), 200))];
 			particles.put(layer, layerParticles);
 			for (int i = 0; i < layerParticles.length; i++)
 			{
@@ -1681,15 +1801,16 @@ class WeatherRenderer
 		return fade * fade * (3f - 2f * fade);
 	}
 
-	private static LoadedSpriteSet loadSpriteSet(Filepath directory, Filepath sharedDirectory, Layer layer) throws IOException
+	private static LoadedSpriteSet loadSpriteSet(Filepath directory, Filepath sharedDirectory, Layer layer,
+		SpriteCache cache) throws IOException
 	{
 		String externalAssetPrefix = layer.externalAssetPrefix();
 		if (externalAssetPrefix != null)
 		{
-			LoadedSpriteSet externalSpriteSet = loadSpriteSetFromFrames(directory, externalAssetPrefix, layer);
+			LoadedSpriteSet externalSpriteSet = loadSpriteSetFromFrames(directory, externalAssetPrefix, layer, cache);
 			if (externalSpriteSet == null)
 			{
-				externalSpriteSet = loadSpriteSetFromFrames(sharedDirectory, externalAssetPrefix, layer);
+				externalSpriteSet = loadSpriteSetFromFrames(sharedDirectory, externalAssetPrefix, layer, cache);
 			}
 			if (externalSpriteSet != null)
 			{
@@ -1699,20 +1820,63 @@ class WeatherRenderer
 
 		if (layer.proceduralSprite())
 		{
-			return buildAtlas(createProceduralSprites(layer));
+			// Generated per layer; shared only by the effects that use this layer (Day/Fall/Blossom).
+			String key = "procedural|" + layer.name();
+			LoadedSpriteSet cached = cache.get(key);
+			if (cached != null)
+			{
+				return cached;
+			}
+			LoadedSpriteSet generated = buildAtlas(createProceduralSprites(layer));
+			generated.key = key;
+			cache.put(key, generated);
+			return generated;
 		}
 
-		LoadedSpriteSet spriteSet = loadSpriteSetFromFrames(directory, layer.assetPrefix, layer);
-		return spriteSet != null ? spriteSet : loadSpriteSetFromFrames(sharedDirectory, layer.assetPrefix, layer);
+		LoadedSpriteSet spriteSet = loadSpriteSetFromFrames(directory, layer.assetPrefix, layer, cache);
+		return spriteSet != null ? spriteSet : loadSpriteSetFromFrames(sharedDirectory, layer.assetPrefix, layer, cache);
 	}
 
-	private static LoadedSpriteSet loadSpriteSetFromFrames(Filepath directory, String assetPrefix, Layer layer) throws IOException
+	/**
+	 * What a frame-based atlas depends on besides its files. Moonlight and soft-edged layers
+	 * process frames in their own way (blur, skipped frames, scales), so each is its own kind;
+	 * every other layer only decodes and packs, so same files give the same atlas.
+	 */
+	static String atlasProcessing(String layerName, boolean moonlightLayer, boolean softFrameEdges)
+	{
+		return moonlightLayer || softFrameEdges ? layerName : "plain";
+	}
+
+	private static LoadedSpriteSet loadSpriteSetFromFrames(Filepath directory, String assetPrefix, Layer layer,
+		SpriteCache cache) throws IOException
 	{
 		List<FramePath> framePaths = listFrames(directory, assetPrefix);
 		if (framePaths.isEmpty())
 		{
 			return null;
 		}
+		StringBuilder key = new StringBuilder(atlasProcessing(layer.name(), layer.moonlightLayer(), layer.softFrameEdges()));
+		for (FramePath framePath : framePaths)
+		{
+			key.append('|').append(framePath.path);
+		}
+		String cacheKey = key.toString();
+		LoadedSpriteSet cached = cache.get(cacheKey);
+		if (cached != null)
+		{
+			return cached;
+		}
+		LoadedSpriteSet loaded = decodeFrames(framePaths, layer);
+		if (loaded != null)
+		{
+			loaded.key = cacheKey;
+			cache.put(cacheKey, loaded);
+		}
+		return loaded;
+	}
+
+	private static LoadedSpriteSet decodeFrames(List<FramePath> framePaths, Layer layer) throws IOException
+	{
 
 		List<BufferedImage> images = new ArrayList<>(framePaths.size());
 		List<Float> frameScales = new ArrayList<>(framePaths.size());
@@ -2423,7 +2587,8 @@ class WeatherRenderer
 
 	private static List<FramePath> listFrames(Filepath directory, String assetPrefix) throws IOException
 	{
-		Pattern pattern = Pattern.compile("^" + Pattern.quote(assetPrefix) + "(\\d+)\\.png$", Pattern.CASE_INSENSITIVE);
+		// At most 9 digits, so the number always fits an int; a longer name is simply not a frame.
+		Pattern pattern = Pattern.compile("^" + Pattern.quote(assetPrefix) + "(\\d{1,9})\\.png$", Pattern.CASE_INSENSITIVE);
 		List<FramePath> framePaths = new ArrayList<>();
 		if (!directory.exists())
 		{
@@ -2525,6 +2690,13 @@ class WeatherRenderer
 		private final GpuSkyExtensionConfig.WeatherEffect effect;
 		private final EnumMap<Layer, LoadedSpriteSet> spriteSets = new EnumMap<>(Layer.class);
 		private boolean complete = true;
+		/** Set at upload when a set's texture was lost with an old context: reload at once, not after a backoff. */
+		private volatile boolean foundStale;
+
+		boolean foundStale()
+		{
+			return foundStale;
+		}
 
 		GpuSkyExtensionConfig.WeatherEffect effect()
 		{
@@ -2549,10 +2721,15 @@ class WeatherRenderer
 
 	private static final class LoadedSpriteSet
 	{
-		private final BufferedImage atlas;
+		/** Decoded pixels; released (null) by the client thread once uploaded. */
+		private volatile BufferedImage atlas;
 		private final SpriteFrame[] frames;
 		private final int displayWidth;
 		private final int displayHeight;
+		/** Identity for sharing: processing kind plus frame files. Set by the loader before publishing. */
+		private String key;
+		/** Uploaded, released, and that texture lost with its GPU context: must be decoded again. */
+		private volatile boolean stale;
 
 		private LoadedSpriteSet(BufferedImage atlas, SpriteFrame[] frames, int displayWidth, int displayHeight)
 		{
@@ -2560,6 +2737,61 @@ class WeatherRenderer
 			this.frames = frames;
 			this.displayWidth = displayWidth;
 			this.displayHeight = displayHeight;
+		}
+	}
+
+	/** One GPU texture and the number of layers drawing with it. Client thread. */
+	private static final class SharedTexture
+	{
+		private final int texture;
+		private int users;
+
+		private SharedTexture(int texture)
+		{
+			this.texture = texture;
+		}
+	}
+
+	/**
+	 * Decoded sprite sets of one loader session, by key, so a layer or effect that needs the
+	 * same frames reuses the first decode. Entries whose pixels were released and whose texture
+	 * was lost (stale) are decoded again.
+	 */
+	static final class SpriteCache
+	{
+		private final Map<String, LoadedSpriteSet> sets = new HashMap<>();
+
+		private synchronized LoadedSpriteSet get(String key)
+		{
+			LoadedSpriteSet set = sets.get(key);
+			if (set != null && set.stale)
+			{
+				sets.remove(key);
+				return null;
+			}
+			return set;
+		}
+
+		private synchronized void put(String key, LoadedSpriteSet set)
+		{
+			sets.put(key, set);
+		}
+
+		/** The GPU context changed: every set already uploaded (pixels released) must be decoded again. */
+		synchronized void contextLost()
+		{
+			for (LoadedSpriteSet set : sets.values())
+			{
+				if (set.atlas == null)
+				{
+					set.stale = true;
+				}
+			}
+		}
+
+		synchronized int size()
+		{
+			return sets.size();
 		}
 	}
 

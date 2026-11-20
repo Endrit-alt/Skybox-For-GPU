@@ -10,7 +10,7 @@ uniform sampler2D mawWaterDepth;
 uniform ivec4 mawWaterViewport;
 uniform sampler2D mawSceneDepth;
 uniform int mawDepthFade;
-// Water opacity over objects just below the surface, relative to open water.
+// Water opacity over objects just below the surface, relative to the base opacity.
 const float MAW_NEAR_OBJECT_CLARITY = 0.80;
 uniform float mawDepthBias;
 // Perspective reversed-depth ratios recover vertical submersion, not raw
@@ -639,7 +639,7 @@ vec3 mawSkyColor(vec3 worldDirection, float lod) {
   vec2 uv = vec2(fract(atan(directionX, directionZ) / 6.28318530718),
     clamp(0.5 + asin(clamp(directionY, -1.0, 1.0)) / 3.14159265359, 0.0, 1.0));
   vec3 raw = mix(textureLod(mawSkyPrevious, uv, lod).rgb, textureLod(mawSkyCurrent, uv, lod).rgb, mawSkyBlend);
-  return vec3(1.0) - exp(-raw * mawSkyExposure);
+  return vec3(1.0) - exp(-gpuSkyAdjustColor(raw) * mawSkyExposure);
 }
 
 // Skybox fog matching. The Weather plugin fades the scene toward the sky color
@@ -649,8 +649,11 @@ uniform int mawSkyFog;
 uniform vec2 mawSkyScreen;       // fov, aspect
 uniform vec4 mawSkyViewport;     // origin.xy, size.xy
 uniform vec2 mawSkyDistanceFade; // draw distance, world light
+// Same per-texture detail level as Skybox's terrain lighting (7 at 8K, 6 at 4K, 5 at 2K),
+// so water fog matches the fog on the terrain beside it at every resolution.
+uniform vec2 mawSkyLods; // current, previous
 vec3 mawSkyRawLod7(vec2 uv) {
-  return mix(textureLod(mawSkyPrevious, uv, 7.0).rgb, textureLod(mawSkyCurrent, uv, 7.0).rgb, mawSkyBlend);
+  return gpuSkyAdjustColor(mix(textureLod(mawSkyPrevious, uv, mawSkyLods.y).rgb, textureLod(mawSkyCurrent, uv, mawSkyLods.x).rgb, mawSkyBlend));
 }
 vec3 mawSkyScreenColor(vec2 fragCoord) {
   vec2 coord = fragCoord - mawSkyViewport.xy;
@@ -673,10 +676,3 @@ vec3 mawSkyScreenColor(vec2 fragCoord) {
   return vec3(1.0) - exp(-c * 0.125 * mawSkyExposure);
 }
 
-// What open water shows through to: nothing is drawn under OSRS water, so the
-// background behind it - the Weather skybox when it is drawn, otherwise the
-// host's sky/fog clear color. Deep objects fade into water over this instead
-// of into solid water color, so they blend with the surrounding open water.
-vec3 mawOpenWaterBackground(vec2 fragCoord, vec3 hostSkyColor) {
-  return mawSkyFog != 0 ? mawSkyScreenColor(fragCoord) : hostSkyColor;
-}

@@ -169,7 +169,27 @@ final class WaterTransparency
 		}
 	}
 
+	/** Before the top-level scene's frame: prepares this frame's snapshot outside the scene's passes. */
+	void beforeScene()
+	{
+		if (captureFailed) return;
+		try { surface.clearAhead(); }
+		catch (RuntimeException ex)
+		{
+			captureFailed = true;
+			surface.destroy();
+			log.warn("Water alpha-depth capture unavailable until the next GPU context", ex);
+		}
+	}
+
 	void clear() { active = false; zones.clear(); surface.invalidate(); }
+
+	/** Frees the viewport snapshots (reallocated by the next capture); keeps the program locations. */
+	void releaseBuffers()
+	{
+		clear();
+		surface.destroy();
+	}
 
 	void destroy()
 	{

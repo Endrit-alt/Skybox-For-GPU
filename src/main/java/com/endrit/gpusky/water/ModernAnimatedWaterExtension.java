@@ -9,7 +9,9 @@ import net.runelite.api.Client;
 import net.runelite.api.Projection;
 import net.runelite.api.Scene;
 import net.runelite.api.WorldView;
+import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.hooks.DrawCallbacks;
+import com.endrit.gpusky.MainWorldLocation;
 import net.runelite.client.plugins.gpu.api.GpuExtension;
 import org.lwjgl.opengl.GL33C;
 import org.slf4j.Logger;
@@ -80,7 +82,8 @@ final class ModernAnimatedWaterExtension extends GpuExtension implements WaterDr
 	private static final String VERTEX_DEFINITIONS = "out vec3 mawWorldPosition;\nout vec3 mawToCamera;\nuniform int mawWaterPass;";
 	private static final String VERTEX_MAIN_POST = "mawWorldPosition = worldPos.xyz;\nmawToCamera = cameraPos - worldPos.xyz;\n"
 		+ "if (mawWaterPass == 2 && !(" + WaterSurfaceClassifier.GPU_SHADER_PREDICATE + ")) gl_Position = vec4(2.0, 2.0, 2.0, 1.0);";
-	private static final String FRAGMENT_DEFINITIONS = readShader("water-definitions.glsl");
+	private static final String FRAGMENT_DEFINITIONS = com.endrit.gpusky.SkyboxColorAdjustment.GLSL
+		+ "\n" + readShader("water-definitions.glsl");
 	private static final String FRAGMENT_MAIN_POST = readShader("water-fragment.glsl")
 		.replace("__WATER_PREDICATE__", WaterSurfaceClassifier.GPU_SHADER_PREDICATE);
 	private final Client client;
@@ -91,11 +94,14 @@ final class ModernAnimatedWaterExtension extends GpuExtension implements WaterDr
 	private final FoamSettings foam = new FoamSettings();
 	private final BubbleEvents bubbles = new BubbleEvents();
 	private final WaterTransparency transparency = new WaterTransparency();
+	/** The shore field, bank colours and their workers exist only while animated water is on. */
+	private final WaterResourceSwitch resources =
+		new WaterResourceSwitch(this::createWaterResources, this::releaseWaterResources);
 	private WaterDrawCallbacks callbacks;
 	private final Map<String, Integer> locations = new HashMap<>();
 	private static final String[] SCENE_UNIFORMS = {
 		"mawEnabled", "mawTime", "mawSpeed", "mawWaveStrength", "mawWaterBrightness", "mawWaterTint",
-		"mawHighlightIntensity", "mawNormalDetailStrength", "mawAlternateWaves", "mawShoreFollowingWaves", "mawOpenRippleStrength", "mawSurfaceGrainStrength", "mawSurfaceDepth", "mawSoftReliefShadows", "mawSwashFoam", "mawSwashOpacity", "mawHazeStyle", "mawSkyEnabled", "mawSkyFog", "mawSkyScreen", "mawSkyViewport", "mawSkyDistanceFade", "mawSkyCurrent", "mawSkyPrevious", "mawSkyBlend", "mawSkyYawOffset", "mawSkyPitchOffset", "mawSkyExposure", "mawSkyLight", "mawSkyContrast", "mawSkySun", "mawCameraAngles", "mawSkyReflection", "mawSkyGlint", "mawReflectionNoise", "mawGlintFollowsCamera", "mawBankColor", "mawBankColorValid", "mawBankOffset", "mawDebugView",
+		"mawHighlightIntensity", "mawNormalDetailStrength", "mawAlternateWaves", "mawShoreFollowingWaves", "mawOpenRippleStrength", "mawSurfaceGrainStrength", "mawSurfaceDepth", "mawSoftReliefShadows", "mawSwashFoam", "mawSwashOpacity", "mawHazeStyle", "mawSkyEnabled", "mawSkyFog", "mawSkyScreen", "mawSkyViewport", "mawSkyDistanceFade", "mawSkyCurrent", "mawSkyPrevious", "mawSkyBlend", "mawSkyLods", "mawSkyYawOffset", "mawSkyPitchOffset", "mawSkyExposure", "mawSkyLight", "mawSkyContrast", "mawSkySun", "mawCameraAngles", "mawSkyReflection", "mawSkyGlint", "mawReflectionNoise", "mawGlintFollowsCamera", "mawBankColor", "mawBankColorValid", "mawBankOffset", "mawDebugView",
 		"mawFoamOpacity[0]", "mawFoamWidth[0]", "mawFoamSoftness[0]", "mawShoreMask",
 		"mawShoreTransform", "mawBubbleCount", "mawBubbleOpacity", "mawShoreMaskValid",
 		"mawWorldBase", "mawBubbles[0]", "mawBubbleScale[0]", "mawShoreHistory", "mawPreviousShoreMask",
@@ -103,6 +109,12 @@ final class ModernAnimatedWaterExtension extends GpuExtension implements WaterDr
 	};
 	private int cachedProgram;
 	private boolean contextActive;
+	/** Stopped for good (client thread); a registration left behind stays inert. */
+	private boolean closed;
+	/** A callback threw: water is off until the GPU context is recreated or Water restarts. */
+	private boolean failed;
+	private boolean disabledUntilRestart;
+	private boolean failureLogged;
 	private boolean updatedBeforeScene;
 	private long previousNanos;
 	private int framesWithoutScene;
@@ -117,6 +129,7 @@ final class ModernAnimatedWaterExtension extends GpuExtension implements WaterDr
 	@Override
 	public String injectShaderExtension(String hook)
 	{
+		if (closed) return null;
 		switch (hook)
 		{
 			case "rlst_vert_definitions": return VERTEX_DEFINITIONS;
@@ -131,9 +144,24 @@ final class ModernAnimatedWaterExtension extends GpuExtension implements WaterDr
 	public void onContextCreate()
 	{
 		checkClientThread();
-		if (contextActive) return;
-		shoreMask.create();
-		bankColors.create();
+		if (closed || disabledUntilRestart || contextActive) return;
+		// A new context is a fresh start after an earlier failure.
+		failed = false;
+		failureLogged = false;
+		try
+		{
+			createContext();
+		}
+		catch (Throwable ex)
+		{
+			fail("starting", ex, false);
+		}
+	}
+
+	private void createContext()
+	{
+		// The large shoreline resources are created by the first frame that has water on.
+		resources.contextLost();
 		locations.clear();
 		cachedProgram = 0;
 		previousNanos = System.nanoTime();
@@ -148,22 +176,49 @@ final class ModernAnimatedWaterExtension extends GpuExtension implements WaterDr
 	public void onContextDestroy()
 	{
 		checkClientThread();
-		detachDrawCallbacks(); // Clear the old wrapper before the GPU clears/replaces it.
-		shoreMask.destroy();
-		bankColors.destroy();
-		bubbles.clear();
-		transparency.destroy();
-		locations.clear();
-		cachedProgram = 0;
-		updatedBeforeScene = false;
-		contextActive = false;
+		try
+		{
+			detachDrawCallbacks(); // Clear the old wrapper before the GPU clears/replaces it.
+			shoreMask.destroy();
+			bankColors.destroy();
+			bubbles.clear();
+			transparency.destroy();
+		}
+		catch (RuntimeException ex)
+		{
+			// The GPU destroys its context right after this; never break its shutdown.
+			log.warn("Water for GPU: error while releasing GPU resources", ex);
+		}
+		finally
+		{
+			resources.contextLost();
+			locations.clear();
+			cachedProgram = 0;
+			updatedBeforeScene = false;
+			contextActive = false;
+		}
 	}
 
 	@Override
 	public void onProgramCreate(int program)
 	{
 		checkClientThread();
+		if (closed || failed) return;
+		try
+		{
+			programCreated(program);
+		}
+		catch (Throwable ex)
+		{
+			// A new program starts with mawEnabled = 0, and binding programs here is unsafe.
+			fail("preparing the recompiled shaders", ex, false);
+		}
+	}
+
+	private void programCreated(int program)
+	{
 		if (!contextActive) onContextCreate();
+		if (failed) return;
 		transparency.onProgramCreate(program);
 		cachedProgram = program;
 		skybox.onProgram(program);
@@ -181,15 +236,64 @@ final class ModernAnimatedWaterExtension extends GpuExtension implements WaterDr
 	{
 		// This supported callback precedes terrain when the scene has no native skybox.
 		// Only prepare our water material; never claim or replace the sky.
-		updateSceneUniforms();
-		updatedBeforeScene = true;
+		if (closed || failed) return false;
+		try
+		{
+			updateSceneUniforms();
+			updatedBeforeScene = true;
+		}
+		catch (Throwable ex)
+		{
+			fail("preparing water before the scene", ex, true);
+		}
 		return false;
+	}
+
+	@Override
+	public void callbackFailed(String during, Throwable ex)
+	{
+		fail(during, ex, true);
+	}
+
+	/**
+	 * Contains an error inside a GPU callback (the API runs extensions without a try/catch,
+	 * so it would otherwise end the GPU plugin's frame). Water is switched off in the current
+	 * shader and the draw wrapper becomes pass-through now; GL resources and the wrapper itself
+	 * are released later, by the context's destruction or Water stopping, not mid-frame.
+	 */
+	private void fail(String during, Throwable ex, boolean switchOffInShader)
+	{
+		failed = true;
+		// Only an out-of-memory failure is retried by a new GPU context; any other Error is not.
+		if (ex instanceof Error && !(ex instanceof OutOfMemoryError)) disabledUntilRestart = true;
+		if (!failureLogged)
+		{
+			failureLogged = true;
+			log.warn("Water for GPU stopped after an error while {}; restart the GPU plugin or turn the Skybox "
+				+ "plugin off and on to try again", during, ex);
+		}
+		if (callbacks != null) callbacks.deactivate();
+		if (!switchOffInShader || !contextActive || cachedProgram == 0) return;
+		try
+		{
+			int previousProgram = GL33C.glGetInteger(GL33C.GL_CURRENT_PROGRAM);
+			try
+			{
+				GL33C.glUseProgram(cachedProgram);
+				GL33C.glUniform1i(GL33C.glGetUniformLocation(cachedProgram, "mawEnabled"), 0);
+			}
+			finally { GL33C.glUseProgram(previousProgram); }
+		}
+		catch (RuntimeException switchOff)
+		{
+			log.debug("Water for GPU: could not switch the water shader off", switchOff);
+		}
 	}
 
 	void attachDrawCallbacks()
 	{
 		checkClientThread();
-		if (callbacks != null) return;
+		if (closed || failed || callbacks != null) return;
 		DrawCallbacks delegate = client.getDrawCallbacks();
 		if (delegate == null) return;
 		callbacks = new WaterDrawCallbacks(delegate, this);
@@ -210,7 +314,7 @@ final class ModernAnimatedWaterExtension extends GpuExtension implements WaterDr
 
 	@Override public void afterScene(Scene scene, float cameraX, float cameraY, float cameraZ)
 	{
-		if (scene.getWorldViewId() != WorldView.TOPLEVEL) return;
+		if (closed || failed || scene.getWorldViewId() != WorldView.TOPLEVEL) return;
 		framesWithoutScene = 0;
 		// Runs AFTER the GPU has established the framebuffer/program, including native
 		// skybox scenes which do not call the extension's drawSkybox hook.
@@ -240,6 +344,12 @@ final class ModernAnimatedWaterExtension extends GpuExtension implements WaterDr
 		updatedBeforeScene = true;
 		transparency.beginFrame(contextActive && config.animatedWater(), WaterTransparency.WATER_OPACITY_PERCENT,
 			cameraX, cameraY, cameraZ);
+	}
+
+	@Override public void beforeScene()
+	{
+		if (closed || failed || !contextActive || !config.animatedWater()) return;
+		transparency.beforeScene();
 	}
 
 	@Override public void drawZone(DrawCallbacks delegate, Projection projection, Scene scene, int x, int z)
@@ -278,8 +388,11 @@ final class ModernAnimatedWaterExtension extends GpuExtension implements WaterDr
 		animationTime += Math.min(1.0, Math.max(0, (now - previousNanos) / 1_000_000_000.0))
 			* Math.max(0, config.animationSpeed()) / 100.0;
 		previousNanos = now;
-		set1i("mawEnabled", config.animatedWater() ? 1 : 0);
-		if (!config.animatedWater()) { bubbles.clear(); return; } // No scene capture/worker/upload while disabled.
+		boolean enabled = config.animatedWater();
+		// Client thread, GL context current: free or recreate the shoreline resources on a change.
+		resources.sync(enabled);
+		set1i("mawEnabled", enabled ? 1 : 0);
+		if (!enabled) { bubbles.clear(); return; } // No scene capture/worker/upload while disabled.
 
 		foam.update(config);
 		int debug = WaterDebugView.NORMAL.ordinal();
@@ -356,10 +469,12 @@ final class ModernAnimatedWaterExtension extends GpuExtension implements WaterDr
 		if (bubbleVisible && shoreMask.isValid())
 		{
 			float focusX = view.getBaseX() + 52, focusY = view.getBaseY() + 52;
-			if (client.getLocalPlayer() != null)
+			// Main-world position, so bubbles stay around the player while sailing.
+			LocalPoint player = MainWorldLocation.ofPlayer(client);
+			if (player != null)
 			{
-				focusX = view.getBaseX() + client.getLocalPlayer().getLocalLocation().getX() / 128f;
-				focusY = view.getBaseY() + client.getLocalPlayer().getLocalLocation().getY() / 128f;
+				focusX = view.getBaseX() + player.getX() / 128f;
+				focusY = view.getBaseY() + player.getY() / 128f;
 			}
 			int count = bubbles.update(shoreMask.bubbleSites(), animationTime,
 				config.bubbleFrequency() / 100f, focusX, focusY);
@@ -375,6 +490,20 @@ final class ModernAnimatedWaterExtension extends GpuExtension implements WaterDr
 
 	@Override
 	public void onPostDrawToplevel()
+	{
+		// After a failure or close, do nothing here, in particular no re-wrapping below.
+		if (closed || failed) return;
+		try
+		{
+			postDrawToplevel();
+		}
+		catch (Throwable ex)
+		{
+			fail("finishing the frame", ex, true);
+		}
+	}
+
+	private void postDrawToplevel()
 	{
 		// Self-heal the draw-callback wrapper: if logged-in frames keep drawing without
 		// reaching our afterScene, something replaced the callbacks we wrapped (seen
@@ -418,6 +547,7 @@ final class ModernAnimatedWaterExtension extends GpuExtension implements WaterDr
 		GL33C.glUniform4f(location("mawSkyViewport"), skybox.originX, skybox.originY, skybox.viewportW, skybox.viewportH);
 		GL33C.glUniform2f(location("mawSkyDistanceFade"), skybox.drawDistance, skybox.worldLight);
 		set1f("mawSkyBlend", skybox.blend);
+		GL33C.glUniform2f(location("mawSkyLods"), skybox.currentLod, skybox.previousLod);
 		set1f("mawSkyYawOffset", skybox.yawOffset);
 		set1f("mawSkyPitchOffset", skybox.pitchOffset);
 		set1f("mawSkyExposure", skybox.exposure);
@@ -436,9 +566,31 @@ final class ModernAnimatedWaterExtension extends GpuExtension implements WaterDr
 		finally { GL33C.glActiveTexture(previousActive); }
 	}
 
+	/** Shore field textures, bank colours and their worker threads and scratch memory. */
+	private void createWaterResources()
+	{
+		shoreMask.create();
+		bankColors.create();
+		log.debug("Water for GPU: shoreline resources created");
+	}
+
+	/**
+	 * Animated water was switched off: cancel the workers and free their scratch memory, the
+	 * shore/bank textures and the viewport snapshots. The extension stays registered, and the
+	 * next frame with water on recreates them and rebuilds the shoreline for the current scene.
+	 */
+	private void releaseWaterResources()
+	{
+		shoreMask.destroy();
+		bankColors.destroy();
+		bubbles.clear();
+		transparency.releaseBuffers();
+		log.debug("Water for GPU: shoreline resources released while water is off");
+	}
+
 	void markShoreMaskDirty() { shoreMask.markDirty(); bankColors.markDirty(); }
 	void clearShoreHistory() { shoreMask.clearHistory(); bubbles.clear(); }
-	void close() { detachDrawCallbacks(); if (contextActive) onContextDestroy(); }
+	void close() { closed = true; detachDrawCallbacks(); if (contextActive) onContextDestroy(); }
 
 	private int location(String name)
 	{

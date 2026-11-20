@@ -139,6 +139,19 @@ final class RegionOverride
 		return enabled && parsedRegionIds().contains(COX_OLM_REGION_ID);
 	}
 
+	/** Whether a typed token means this region, compared by number ("012889", "+12889"). */
+	static boolean isRegion(String token, int regionId)
+	{
+		try
+		{
+			return Integer.parseInt(token.trim()) == regionId;
+		}
+		catch (NumberFormatException ex)
+		{
+			return false;
+		}
+	}
+
 	Set<Integer> parsedRegionIds()
 	{
 		if (regionIds == null || regionIds.trim().isEmpty())

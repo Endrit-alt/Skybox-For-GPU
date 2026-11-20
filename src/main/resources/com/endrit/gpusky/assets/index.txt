@@ -11,10 +11,11 @@ weather/presets/Blossom.jpg
 weather/presets/Cox.jpg
 weather/presets/Daylight.jpg
 weather/presets/Moonlight.jpg
+weather/presets/Rain.jpg
 weather/presets/Sandstorm.jpg
 weather/presets/Snow.jpg
 weather/presets/Sunlight.jpg
-weather/presets/rain.jpg
+weather/presets/TFA.jpg
 weather/sandstorm/alternate_smoke_0.png
 weather/sandstorm/alternate_smoke_1.png
 weather/sandstorm/alternate_smoke_2.png

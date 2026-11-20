@@ -10,6 +10,8 @@ final class WaterSurfaceBuffer
 	private int framebuffer, sceneFramebuffer, sceneDepth, color, depth, width, height;
 	private final int[] viewport = new int[4];
 	private boolean valid;
+	/** Cleared by {@link #clearAhead()} before this frame's scene, and not used since. */
+	private boolean cleared;
 
 	boolean isValid() { return valid; }
 	int[] viewport() { return viewport; }
@@ -32,6 +34,34 @@ final class WaterSurfaceBuffer
 		finally { state.restore(viewport); }
 	}
 
+	/**
+	 * Clears the snapshot before the scene's own frame starts. Clearing this second depth
+	 * buffer in the middle of the scene (between its opaque and alpha passes) made the GPU
+	 * accept hidden alpha faces for one frame shortly after a client launch (seen on NVIDIA,
+	 * driver 610.88): see AGENTS.md "First-launch alpha glitch". Nothing to do before the
+	 * first allocation; that frame is simply not captured.
+	 */
+	void clearAhead()
+	{
+		if (framebuffer == 0 || width <= 0 || height <= 0) return;
+		int[] previousViewport = new int[4];
+		glGetIntegerv(GL_VIEWPORT, previousViewport);
+		CaptureState state = new CaptureState();
+		try
+		{
+			glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+			glViewport(0, 0, width, height);
+			glDisable(GL_SCISSOR_TEST);
+			glDepthMask(true);
+			glColorMask(true, true, true, true);
+			glClearColor(0, 0, 0, 0);
+			glClearDepth(0);
+			glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+			cleared = true;
+		}
+		finally { state.restore(previousViewport); }
+	}
+
 	void capture(Runnable drawWater)
 	{
 		valid = false;
@@ -41,6 +71,10 @@ final class WaterSurfaceBuffer
 		try
 		{
 			allocate(viewport[2], viewport[3]);
+			// Never clear here, mid-scene. Not cleared ahead (first frame, or just resized):
+			// skip this frame; the next one is cleared before its scene.
+			if (!cleared) return;
+			cleared = false;
 			glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
 			glViewport(0, 0, width, height);
 			glDisable(GL_SCISSOR_TEST);
@@ -49,9 +83,6 @@ final class WaterSurfaceBuffer
 			glDepthFunc(GL_GREATER);
 			glDepthMask(true);
 			glColorMask(true, true, true, true);
-			glClearColor(0, 0, 0, 0);
-			glClearDepth(0);
-			glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 			drawWater.run();
 			valid = true;
 		}
@@ -100,6 +131,7 @@ final class WaterSurfaceBuffer
 			if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
 				throw new IllegalStateException("Water scene-depth framebuffer incomplete");
 			width = nextWidth; height = nextHeight;
+			cleared = false; // New storage: contents undefined until cleared ahead.
 		}
 		finally
 		{
@@ -121,6 +153,7 @@ final class WaterSurfaceBuffer
 	void destroy()
 	{
 		valid = false;
+		cleared = false;
 		if (framebuffer != 0) glDeleteFramebuffers(framebuffer);
 		if (color != 0) glDeleteTextures(color);
 		if (depth != 0) glDeleteTextures(depth);

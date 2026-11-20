@@ -7,6 +7,8 @@ import java.awt.Font;
 import java.awt.FontMetrics;
 import java.awt.Graphics;
 import java.awt.Graphics2D;
+import java.awt.GraphicsConfiguration;
+import java.awt.GraphicsDevice;
 import java.awt.Point;
 import java.awt.Window;
 import java.awt.event.ComponentAdapter;
@@ -18,9 +20,12 @@ import javax.swing.JWindow;
 import javax.swing.SwingUtilities;
 import javax.swing.UIManager;
 import net.runelite.api.Client;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 final class SkyboxLoadingOverlay extends JComponent
 {
+	private static final Logger log = LoggerFactory.getLogger(SkyboxLoadingOverlay.class);
 	private static final String EIGHT_K_TITLE = "Loading 8K skybox textures...";
 	private static final String EIGHT_K_DETAIL =
 		"Choose 4K or 2K Texture resolution in Skybox for GPU settings for faster loading.";
@@ -29,9 +34,16 @@ final class SkyboxLoadingOverlay extends JComponent
 		"Disable Pre-load skybox presets in Skybox for GPU settings to load them on demand.";
 	private static final String WAITING_TITLE = "Skybox preloading is waiting for GPU...";
 	private static final String WAITING_DETAIL = "Enable the GPU plugin to finish preloading skybox presets.";
+	private static final String MEMORY_TITLE = "Skybox paused: out of memory";
+	private static final String MEMORY_DETAIL =
+		"Lower the texture resolution or raise RuneLite's memory limit. Changing a Skybox setting retries.";
+	private static final String REDUCED_DETAIL =
+		"Not enough memory for this resolution, so some skies load at 4K instead (see the log).";
 	private static final int PADDING = 8;
 	private static final int LINE_GAP = 2;
 	private static final Color BACKGROUND = new Color(0, 0, 0, 190);
+	/** Used where the window cannot be see-through, so the notice is still readable. */
+	private static final Color OPAQUE_BACKGROUND = new Color(25, 25, 25);
 	private static final Color TITLE_COLOR = Color.WHITE;
 	private static final Color DETAIL_COLOR = new Color(210, 210, 210);
 
@@ -73,6 +85,7 @@ final class SkyboxLoadingOverlay extends JComponent
 	private Canvas canvas;
 	private Window owner;
 	private JWindow window;
+	private boolean translucent;
 
 	SkyboxLoadingOverlay(Client client, GpuSkyExtensionPlugin plugin)
 	{
@@ -97,26 +110,49 @@ final class SkyboxLoadingOverlay extends JComponent
 		}
 
 		canvas = client.getCanvas();
-		owner = SwingUtilities.getWindowAncestor(canvas);
+		owner = canvas == null ? null : SwingUtilities.getWindowAncestor(canvas);
 		if (owner == null)
 		{
+			canvas = null;
 			return;
 		}
 
-		window = new JWindow(owner);
-		window.setType(Window.Type.POPUP);
-		window.setFocusableWindowState(false);
-		window.setAutoRequestFocus(false);
-		window.setBackground(new Color(0, 0, 0, 0));
-		window.getContentPane().add(this);
-		setPreferredSize(noticeSize());
-		window.pack();
+		try
+		{
+			window = new JWindow(owner);
+			window.setType(Window.Type.POPUP);
+			window.setFocusableWindowState(false);
+			window.setAutoRequestFocus(false);
+			// A transparent window background throws where per-pixel translucency is not
+			// supported (some Linux desktops, remote sessions); use an opaque notice there.
+			translucent = supportsTranslucency(owner);
+			if (translucent)
+			{
+				window.setBackground(new Color(0, 0, 0, 0));
+			}
+			window.getContentPane().add(this);
+			setPreferredSize(noticeSize());
+			window.pack();
 
-		canvas.addComponentListener(positionListener);
-		canvas.addHierarchyListener(showingListener);
-		owner.addComponentListener(positionListener);
-		positionWindow();
-		refreshVisibility();
+			canvas.addComponentListener(positionListener);
+			canvas.addHierarchyListener(showingListener);
+			owner.addComponentListener(positionListener);
+			positionWindow();
+			refreshVisibility();
+		}
+		catch (RuntimeException ex)
+		{
+			// The notice is optional: never let it stop the plugin or its loading.
+			log.warn("Unable to show the skybox loading notice", ex);
+			uninstall();
+		}
+	}
+
+	private static boolean supportsTranslucency(Window owner)
+	{
+		GraphicsConfiguration configuration = owner.getGraphicsConfiguration();
+		GraphicsDevice device = configuration == null ? null : configuration.getDevice();
+		return device != null && device.isWindowTranslucencySupported(GraphicsDevice.WindowTranslucency.PERPIXEL_TRANSLUCENT);
 	}
 
 	void uninstall()
@@ -189,6 +225,7 @@ final class SkyboxLoadingOverlay extends JComponent
 			return;
 		}
 
+		// Middle of the game view (user choice). The window takes the clicks over its own area.
 		Point canvasLocation = currentCanvas.getLocationOnScreen();
 		int x = canvasLocation.x + Math.max(0, (currentCanvas.getWidth() - currentWindow.getWidth()) / 2);
 		int y = canvasLocation.y + Math.max(0, (currentCanvas.getHeight() - currentWindow.getHeight()) / 2);
@@ -202,9 +239,10 @@ final class SkyboxLoadingOverlay extends JComponent
 		FontMetrics detailMetrics = getFontMetrics(
 			baseFont.deriveFont(Font.PLAIN, Math.max(10f, baseFont.getSize2D() - 1f)));
 		int width = Math.max(
-			Math.max(titleMetrics.stringWidth(WAITING_TITLE),
+			Math.max(Math.max(titleMetrics.stringWidth(WAITING_TITLE), titleMetrics.stringWidth(MEMORY_TITLE)),
 				Math.max(titleMetrics.stringWidth(EIGHT_K_TITLE), titleMetrics.stringWidth(FOUR_K_TITLE))),
-			Math.max(detailMetrics.stringWidth(WAITING_DETAIL),
+			Math.max(Math.max(Math.max(detailMetrics.stringWidth(WAITING_DETAIL), detailMetrics.stringWidth(MEMORY_DETAIL)),
+				detailMetrics.stringWidth(REDUCED_DETAIL)),
 				Math.max(detailMetrics.stringWidth(EIGHT_K_DETAIL), detailMetrics.stringWidth(FOUR_K_DETAIL))))
 			+ PADDING * 2;
 		int height = titleMetrics.getHeight() + detailMetrics.getHeight() + LINE_GAP + PADDING * 2;
@@ -221,9 +259,11 @@ final class SkyboxLoadingOverlay extends JComponent
 		}
 		boolean loadingEightK = plugin.isLoadingEightKPresets();
 		boolean waiting = status == GpuSkyExtensionPlugin.PreloadStatus.WAITING_FOR_GPU;
-		String title = waiting ? WAITING_TITLE : loadingEightK ? EIGHT_K_TITLE
+		boolean memory = status == GpuSkyExtensionPlugin.PreloadStatus.OUT_OF_MEMORY;
+		String title = memory ? MEMORY_TITLE : waiting ? WAITING_TITLE : loadingEightK ? EIGHT_K_TITLE
 			: String.format(FOUR_K_TITLE, plugin.textureResolutionName());
-		String detail = waiting ? WAITING_DETAIL : loadingEightK ? EIGHT_K_DETAIL : FOUR_K_DETAIL;
+		String detail = memory ? MEMORY_DETAIL : waiting ? WAITING_DETAIL
+			: plugin.resolutionReducedForMemory() ? REDUCED_DETAIL : loadingEightK ? EIGHT_K_DETAIL : FOUR_K_DETAIL;
 
 		Graphics2D graphics2D = (Graphics2D) graphics.create();
 		Font baseFont = loadingFont();
@@ -234,8 +274,16 @@ final class SkyboxLoadingOverlay extends JComponent
 		graphics2D.setFont(detailFont);
 		FontMetrics detailMetrics = graphics2D.getFontMetrics();
 
-		graphics2D.setColor(BACKGROUND);
-		graphics2D.fillRoundRect(0, 0, getWidth(), getHeight(), 6, 6);
+		if (translucent)
+		{
+			graphics2D.setColor(BACKGROUND);
+			graphics2D.fillRoundRect(0, 0, getWidth(), getHeight(), 6, 6);
+		}
+		else
+		{
+			graphics2D.setColor(OPAQUE_BACKGROUND);
+			graphics2D.fillRect(0, 0, getWidth(), getHeight());
+		}
 		int titleY = PADDING + titleMetrics.getAscent();
 		graphics2D.setFont(titleFont);
 		graphics2D.setColor(TITLE_COLOR);

@@ -7,6 +7,7 @@ import java.util.Set;
 
 final class DefaultRegionOverrides
 {
+	static final String TFA_ID = "builtin-tfa";
 	private DefaultRegionOverrides()
 	{
 	}
@@ -72,6 +73,10 @@ final class DefaultRegionOverrides
 				12664, 10106, 10362, 10361, 10617, 10618, 11645, 10874, 10873,
 				10105, 14642, 14388, 14132, 14644, 14387, 14386)));
 		defaults.add(createCox(config));
+		RegionOverride tfa = create(config, "TFA", GpuSkyExtensionConfig.RegionWeatherOverride.GALAXY,
+			new RegionIds().add(16470, 16471, 16727, 16728, 16726, 16472, 16474, 16214, 16216, 16215));
+		tfa.id = TFA_ID;
+		defaults.add(tfa);
 		return defaults;
 	}
 
@@ -91,6 +96,7 @@ final class DefaultRegionOverrides
 			config.backlighting(), config.skyboxTint(), config.atmosphere());
 		override.regionIds = regionIds.format();
 		override.weather = weather;
+		override.weatherIntensity = 50;
 		return override;
 	}
 

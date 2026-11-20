@@ -433,7 +433,7 @@ if (mawIsWater) {
         // Edges thin out (sparser sparkles) and only lose a little brightness.
         sparkle *= mix(1.0, 1.0 - 0.4 * smoothstep(0.5, 1.0, side), edgeSoft);
         vec3 rawSun = mix(textureLod(mawSkyPrevious, glintSunUv, glintLod).rgb, textureLod(mawSkyCurrent, glintSunUv, glintLod).rgb, mawSkyBlend);
-        vec3 sunColor = vec3(1.0) - exp(-rawSun * mawSkyExposure);
+        vec3 sunColor = vec3(1.0) - exp(-gpuSkyAdjustColor(rawSun) * mawSkyExposure);
         vec3 glintColor = sunColor / max(dot(sunColor, lumaWeights), 0.25);
         if (layer == 1) glintColor = vec3(1.0); // camera glint: plain white
         waterColor += glintColor * (sparkle + core + halo) * glintMask * sunPresence * mawSkyGlint * clearWater * glintFoamFade;
@@ -442,12 +442,21 @@ if (mawIsWater) {
     waterColor = mix(waterColor, vec3(1.0), clamp(farContactFoamOpacity, 0.0, 1.0));
     waterColor = mix(waterColor, vec3(1.0), clamp(offsetContactFoamOpacity, 0.0, 1.0));
     waterColor = mix(waterColor, vec3(1.0), clamp(contactFoamOpacity, 0.0, 1.0));
-    if (mawSwashFoam != 0 && swash.w > 0.0) {
+    float foamCover = 1.0 - (1.0 - clamp(farOuterFoamOpacity, 0.0, 1.0))
+      * (1.0 - clamp(outerFoamOpacity, 0.0, 1.0)) * (1.0 - clamp(farContactFoamOpacity, 0.0, 1.0))
+      * (1.0 - clamp(offsetContactFoamOpacity, 0.0, 1.0)) * (1.0 - clamp(contactFoamOpacity, 0.0, 1.0));
+    float filmCover = mawSwashFoam != 0 ? clamp(swash.w, 0.0, 1.0) : 0.0;
+    vec3 bankColor = vec3(0.0);
+    vec3 bankFogColor = fogColor.rgb;
+    if (filmCover > 0.0) {
       // Terrain continues up to the foam: paint the receded film with the
       // terrain's own Gouraud colors, rasterized at 4 texels per tile.
       vec3 bank = texture(mawBankColor, (shoreLocal + mawBankOffset + vec2(mawShoreTransform.x)) * mawShoreTransform.y).rgb;
       // Gentle wet-sand darkening toward the foam: 4.8% darker (60% of the former 8%).
-      waterColor = mix(waterColor, bank * mix(1.0, 0.952, swashWet), clamp(swash.w, 0.0, 1.0));
+      bankColor = bank * mix(1.0, 0.952, swashWet);
+#ifdef GPU_SKY_LIGHTING_API
+      if (gpuSkyEnabled != 0) bankColor = gpuSkyLightSurface(bankColor, fFogAmount, true, bankFogColor);
+#endif
     }
     if (mawSwashFoam != 0) {
       // Foam is mostly withheld where it lies over the wet-sand strip, so that
@@ -455,9 +464,14 @@ if (mawIsWater) {
       // sand by the foam line; the foam then starts where the water begins.
       // Ride the surface-depth wavelets: foam is denser on crests, thinner in troughs.
       float swashRelief = mix(0.70, 1.15, wavelets.z);
-      waterColor = mix(waterColor, vec3(1.0), clamp(swash.y * swashRelief * 0.42 * (1.0 - 0.85 * clamp(swash.w, 0.0, 1.0)), 0.0, 1.0));
+      float hazeAlpha = clamp(swash.y * swashRelief * 0.42 * (1.0 - 0.85 * filmCover), 0.0, 1.0);
+      waterColor = mix(waterColor, vec3(1.0), hazeAlpha);
+      bankColor = mix(bankColor, vec3(1.0), hazeAlpha);
       // Foam opacity: line at 22%, haze at 42% of the original swash strength.
-      waterColor = mix(waterColor, vec3(1.0), clamp(swash.x * swashRelief * 0.22 * (1.0 - 0.85 * clamp(swash.w, 0.0, 1.0)), 0.0, 1.0));
+      float lineAlpha = clamp(swash.x * swashRelief * 0.22 * (1.0 - 0.85 * filmCover), 0.0, 1.0);
+      waterColor = mix(waterColor, vec3(1.0), lineAlpha);
+      bankColor = mix(bankColor, vec3(1.0), lineAlpha);
+      foamCover = 1.0 - (1.0 - foamCover) * (1.0 - hazeAlpha) * (1.0 - lineAlpha);
     }
 
     float bubbleAlpha = 0.0;
@@ -471,6 +485,7 @@ if (mawIsWater) {
     }
     bubbleAlpha *= mawBubbleOpacity * smoothstep(0.05, 0.25, rawDistance) * maskVisible;
     waterColor = mix(waterColor, vec3(1.0), clamp(bubbleAlpha, 0.0, 1.0));
+    bankColor = mix(bankColor, vec3(1.0), clamp(bubbleAlpha, 0.0, 1.0));
     if (mawDebugView == 6) {
       // Distance in tiles: dark at the bank, progressively lighter offshore.
       waterColor = mix(vec3(0.08, 0.15, 0.22), vec3(0.85), clamp(rawDistance / 4.0, 0.0, 1.0));
@@ -478,38 +493,42 @@ if (mawIsWater) {
       waterColor = mix(vec3(0.9, 0.20, 0.12), vec3(0.08, 0.55, 0.85), smoothstep(0.4, 4.0, halfWidth));
     }
     if (mawDebugView != 0 && !inShoreMask) waterColor = vec3(0.65, 0.05, 0.65);
-    // Transparent water never mixes in the stock texture, even on sloped banks.
-    vec3 modernWater = mawWaterPass == 2 ? waterColor : mix(c.rgb, waterColor, horizontalSurface);
+    if (mawDebugView != 0) filmCover = 0.0;
     float waterAlpha = mawWaterPass == 2 ? clamp(mawWaterOpacity, 0.0, 1.0) : c.a;
-    // Swash film is painted terrain, so it is opaque like the bank it continues.
-    if (mawWaterPass == 2 && mawSwashFoam != 0) waterAlpha = mix(waterAlpha, 1.0, clamp(swash.w, 0.0, 1.0));
+    // Visible shore foam blocks submerged shapes without whitening its colour.
+    // Only its faint outer edge fades back to ordinary water transparency.
+    float surfaceCover = max(filmCover, smoothstep(0.0, 0.02, foamCover));
+    if (mawWaterPass == 2) waterAlpha = mix(waterAlpha, 1.0, surfaceCover);
     if (mawWaterPass == 2 && mawDepthFade != 0) {
       ivec2 pixel = ivec2(gl_FragCoord.xy) - mawWaterViewport.xy;
       float sceneDepth = texelFetch(mawSceneDepth, pixel, 0).r;
       float deepFade = mawSubmersionFade(gl_FragCoord.z, sceneDepth, abs(mawToCamera.y)) * mawBankFadeAt(mawWorldPosition);
-      // Deep objects fade into the same look as open water (water over the empty
-      // background), not into solid water color, so they leave no light columns.
-      // Final = mix(object, mix(W, deepLook, f), mix(a, 1, f)).
-      vec3 deepLook = mix(mawOpenWaterBackground(gl_FragCoord.xy, fogColor.rgb), modernWater, waterAlpha);
       // Clearer water over objects just below the surface (something is drawn
       // behind: not the empty background), so even dark rocks read through it.
       bool objectBehind = sceneDepth - mawDepthBias > 0.0000001;
-      // (The opaque swash film over the bank stays opaque.)
-      float filmCover = mawSwashFoam != 0 ? clamp(swash.w, 0.0, 1.0) : 0.0;
-      float nearAlpha = objectBehind ? mix(waterAlpha * MAW_NEAR_OBJECT_CLARITY, waterAlpha, filmCover) : waterAlpha;
-      modernWater = mix(modernWater, deepLook, deepFade);
+      // Block sky/stars where no geometry was drawn; retain transparency over
+      // geometry outside the film/foam, fading deep objects into open-water color.
+      float nearAlpha = objectBehind ? mix(waterAlpha * MAW_NEAR_OBJECT_CLARITY, waterAlpha, surfaceCover) : 1.0;
       waterAlpha = mix(nearAlpha, 1.0, deepFade);
     }
     vec3 waterFogColor = fogColor.rgb;
+    vec3 stockColor = c.rgb;
     if (mawSkyFog != 0) {
       // Match the Weather plugin: fade toward the sky behind this pixel with
       // distance ("world light"), then fog in that same sky color.
       vec3 skyBehind = mawSkyScreenColor(gl_FragCoord.xy);
       float distanceRatio = length(mawToCamera) / max(mawSkyDistanceFade.x, 1.0);
-      modernWater = mix(modernWater, skyBehind, smoothstep(0.01, 1.0, distanceRatio) * 0.50 * mawSkyDistanceFade.y);
+      float worldLight = smoothstep(0.01, 1.0, distanceRatio) * 0.50 * mawSkyDistanceFade.y;
+      waterColor = mix(waterColor, skyBehind, worldLight);
+      stockColor = mix(stockColor, skyBehind, worldLight);
       waterFogColor = skyBehind;
     }
-    FragColor = vec4(mix(modernWater, waterFogColor, fFogAmount), waterAlpha);
+    // The film already has terrain lighting. Keep water's separate lighting off
+    // it, and apply fog once to each material before blending their boundary.
+    vec3 modernWater = mix(mix(waterColor, waterFogColor, fFogAmount),
+      mix(bankColor, bankFogColor, fFogAmount), filmCover);
+    if (mawWaterPass != 2) modernWater = mix(mix(stockColor, waterFogColor, fFogAmount), modernWater, horizontalSurface);
+    FragColor = vec4(modernWater, waterAlpha);
   }
 }
 
@@ -529,9 +548,13 @@ if (mawUnderwaterAlpha != 0 && mawWaterPass == 0) {
       float verticalToWater = nearZ > 0.0 ? abs(mawToCamera.y) * max(0.0, farZ / nearZ) : 0.0;
       vec3 waterPosition = mawWorldPosition + mawToCamera * (1.0 - max(0.0, farZ / max(nearZ, 0.0000001)));
       float deepFade = mawSubmersionFade(waterDepth, gl_FragCoord.z, verticalToWater) * mawBankFadeAt(waterPosition);
-      float opacity = mix(surface.a * MAW_NEAR_OBJECT_CLARITY, 1.0, deepFade);
-      vec3 deepLook = mix(mawOpenWaterBackground(gl_FragCoord.xy, fogColor.rgb), surface.rgb, surface.a);
-      FragColor.rgb = mix(FragColor.rgb, mix(surface.rgb, deepLook, deepFade), opacity);
+      // The snapshot's alpha encodes the combined terrain-film and foam cover,
+      // including classic foam when swash is off. Keep alpha objects behind both.
+      float baseOpacity = clamp(mawWaterOpacity, 0.0, 1.0);
+      float surfaceCover = clamp((surface.a - baseOpacity) / max(1.0 - baseOpacity, 0.0001), 0.0, 1.0);
+      float nearAlpha = mix(surface.a * MAW_NEAR_OBJECT_CLARITY, surface.a, surfaceCover);
+      float opacity = mix(nearAlpha, 1.0, deepFade);
+      FragColor.rgb = mix(FragColor.rgb, surface.rgb, opacity);
     }
   }
 }

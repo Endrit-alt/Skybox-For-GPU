@@ -4,6 +4,7 @@ import java.awt.AWTEvent;
 import java.awt.BorderLayout;
 import java.awt.Color;
 import java.awt.Component;
+import java.awt.KeyboardFocusManager;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.Graphics;
@@ -22,9 +23,12 @@ import java.text.DecimalFormat;
 import java.text.ParseException;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
+import java.util.function.Consumer;
 import javax.swing.BorderFactory;
 import javax.swing.Box;
 import javax.swing.BoxLayout;
@@ -48,10 +52,12 @@ import javax.swing.border.EmptyBorder;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
 import javax.swing.text.DefaultFormatterFactory;
+import javax.swing.text.JTextComponent;
 import javax.swing.text.NumberFormatter;
 import net.runelite.client.ui.ColorScheme;
 import net.runelite.client.ui.PluginPanel;
 import net.runelite.client.ui.components.IconTextField;
+import net.runelite.client.ui.components.colorpicker.RuneliteColorPicker;
 import net.runelite.client.util.Filepath;
 
 final class RegionOverridePanel extends PluginPanel
@@ -59,6 +65,15 @@ final class RegionOverridePanel extends PluginPanel
 	private static final Color CARD_COLOR = new Color(38, 38, 38);
 	private static final Color FIELD_COLOR = new Color(30, 30, 30);
 	private static final Dimension ICON_SIZE = new Dimension(24, 24);
+	/** Typed names and region IDs are saved after this pause (and at once on Enter or focus loss). */
+	static final int TEXT_SAVE_DELAY_MS = 400;
+	private static final int MAX_LISTED_CONFLICTS = 12;
+
+	/** Asks whether duplicate region IDs move to this override. Replaced in tests, where no dialog can open. */
+	interface ConflictPrompt
+	{
+		boolean moveHere(String message);
+	}
 
 	private final GpuSkyExtensionPlugin plugin;
 	private final IconTextField search = new IconTextField();
@@ -67,13 +82,29 @@ final class RegionOverridePanel extends PluginPanel
 	private final Set<String> expanded = new HashSet<>();
 	private final Set<String> expandedRegionLists = new HashSet<>();
 	private final Set<String> newlyAddedOverrides = new HashSet<>();
+	/** Overrides with a panorama import running; it survives reloads, unlike the editors. */
+	private final Set<String> importsInProgress = new HashSet<>();
+	/** Regions the recorder left alone because another override uses them, with that override's name. */
+	private final Map<Integer, String> skippedRegions = new LinkedHashMap<>();
 	private final Timer regionRecorder = new Timer(250, event -> recordCurrentRegion());
 	private final AWTEventListener outsideRegionClickListener = this::onGlobalMouseEvent;
+	private final JButton addButton;
+	private final JPanel unreadableNotice = new JPanel(new BorderLayout(0, 4));
+	private final JLabel recordingNote = new JLabel();
 	private Component temporarilyExpandedRegionField;
 	private Runnable temporaryRegionCollapse;
 	private String recordingOverrideId;
+	private long recordingProfile;
 	private int lastRecordedRegion = -1;
+	/** Bumped by every reload; editors from an older reload are no longer shown. */
+	private int generation;
+	private RuneliteColorPicker openPicker;
 	private boolean disposed;
+	/** The editors of the latest reload. */
+	private final List<OverrideEditor> editors = new ArrayList<>();
+	/** A duplicate-region dialog is open; another check does not start meanwhile. */
+	private boolean validatingRegions;
+	ConflictPrompt conflictPrompt = this::askToMoveRegions;
 
 	RegionOverridePanel(GpuSkyExtensionPlugin plugin)
 	{
@@ -87,16 +118,47 @@ final class RegionOverridePanel extends PluginPanel
 		JLabel title = new JLabel("Region Overrides");
 		title.setForeground(Color.WHITE);
 		header.add(title, BorderLayout.WEST);
-		JButton add = iconButton("+", "Add region override");
-		add.addActionListener(event ->
+		addButton = iconButton("+", "Add region override");
+		addButton.addActionListener(event ->
 		{
-			RegionOverride created = plugin.addRegionOverride();
-			newlyAddedOverrides.add(created.id);
-			expanded.add(created.id);
+			RegionOverride created = plugin.addRegionOverride(plugin.profileId());
+			if (created != null)
+			{
+				newlyAddedOverrides.add(created.id);
+				expanded.add(created.id);
+			}
 			reload();
 		});
-		header.add(add, BorderLayout.EAST);
+		header.add(addButton, BorderLayout.EAST);
 		add(header);
+
+		// Shown instead of the list when the saved overrides could not be read.
+		unreadableNotice.setBackground(CARD_COLOR);
+		unreadableNotice.setBorder(BorderFactory.createCompoundBorder(
+			BorderFactory.createLineBorder(ColorScheme.PROGRESS_ERROR_COLOR), new EmptyBorder(6, 6, 6, 6)));
+		JLabel unreadableText = new JLabel("<html>Your saved region overrides could not be read. A copy was kept in "
+			+ "the setting '" + GpuSkyExtensionPlugin.UNREADABLE_OVERRIDES_KEY + "', and editing is paused so "
+			+ "it is not overwritten.</html>");
+		unreadableText.setForeground(Color.WHITE);
+		unreadableNotice.add(unreadableText, BorderLayout.CENTER);
+		JButton startOver = new JButton("Start over");
+		startOver.setFocusable(false);
+		startOver.addActionListener(event ->
+		{
+			long profile = plugin.profileId();
+			int choice = JOptionPane.showConfirmDialog(this,
+				"Replace the unreadable overrides with the default list? The copy in '"
+					+ GpuSkyExtensionPlugin.UNREADABLE_OVERRIDES_KEY + "' is kept.",
+				"Start over", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+			if (choice == JOptionPane.YES_OPTION)
+			{
+				plugin.discardUnreadableOverrides(profile);
+			}
+		});
+		unreadableNotice.add(startOver, BorderLayout.SOUTH);
+		unreadableNotice.setMaximumSize(new Dimension(Integer.MAX_VALUE, Integer.MAX_VALUE));
+		unreadableNotice.setVisible(false);
+		add(unreadableNotice);
 
 		search.setIcon(IconTextField.Icon.SEARCH);
 		search.setBackground(FIELD_COLOR);
@@ -119,6 +181,12 @@ final class RegionOverridePanel extends PluginPanel
 		controls.add(sortOrder, BorderLayout.EAST);
 		add(controls);
 
+		// Regions the recorder skipped, instead of a dialog popping up while playing.
+		recordingNote.setForeground(ColorScheme.BRAND_ORANGE);
+		recordingNote.setBorder(new EmptyBorder(0, 2, 4, 2));
+		recordingNote.setVisible(false);
+		add(recordingNote);
+
 		list.setLayout(new BoxLayout(list, BoxLayout.Y_AXIS));
 		list.setBackground(ColorScheme.DARK_GRAY_COLOR);
 		add(list);
@@ -127,9 +195,24 @@ final class RegionOverridePanel extends PluginPanel
 
 	void reload()
 	{
+		commitFocusedSpinner();
+		// Typed text not yet saved is saved now if it is still for the active profile (the plugin
+		// also checks the override exists); text typed for another profile is dropped.
+		for (OverrideEditor editor : editors)
+		{
+			editor.flushPending();
+		}
+		editors.clear();
+		generation++;
 		collapseTemporaryRegionList();
 		list.removeAll();
+		boolean unreadable = plugin.overridesUnreadable();
+		unreadableNotice.setVisible(unreadable);
+		addButton.setEnabled(!unreadable);
+		updateRecordingNote();
 		String query = search.getText().trim().toLowerCase(Locale.ROOT);
+		// Profile before the list, matching the plugin, so a switch in between only makes edits refused.
+		long profile = plugin.profileId();
 		List<RegionOverride> overrides = plugin.regionOverrides();
 		if (sortOrder.getSelectedItem() == SortOrder.ALPHABETICAL)
 		{
@@ -154,12 +237,14 @@ final class RegionOverridePanel extends PluginPanel
 			{
 				continue;
 			}
-			list.add(new OverrideEditor(override));
+			OverrideEditor editor = new OverrideEditor(override, profile);
+			editors.add(editor);
+			list.add(editor);
 			list.add(Box.createVerticalStrut(4));
 			matches++;
 		}
 
-		if (matches == 0)
+		if (matches == 0 && !unreadable)
 		{
 			JLabel empty = new JLabel(query.isEmpty() ? "No region overrides" : "No matching overrides");
 			empty.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
@@ -196,10 +281,24 @@ final class RegionOverridePanel extends PluginPanel
 
 	void dispose()
 	{
+		commitFocusedSpinner();
+		// Same checked save as a reload; nothing is saved for another profile or a removed override.
+		for (OverrideEditor editor : editors)
+		{
+			editor.flushPending();
+		}
+		editors.clear();
 		disposed = true;
 		collapseTemporaryRegionList();
 		Toolkit.getDefaultToolkit().removeAWTEventListener(outsideRegionClickListener);
 		stopRecording();
+		RuneliteColorPicker picker = openPicker;
+		openPicker = null;
+		if (picker != null)
+		{
+			// Closed without saving: dispose does not run the picker's close callback.
+			picker.dispose();
+		}
 	}
 
 	void stopRecording()
@@ -207,6 +306,43 @@ final class RegionOverridePanel extends PluginPanel
 		regionRecorder.stop();
 		recordingOverrideId = null;
 		lastRecordedRegion = -1;
+	}
+
+	/** The note stays after recording stops, so it can still be acted on, until the next recording. */
+	private void clearSkippedRegions()
+	{
+		skippedRegions.clear();
+		updateRecordingNote();
+	}
+
+	private void updateRecordingNote()
+	{
+		if (skippedRegions.isEmpty())
+		{
+			recordingNote.setText("");
+			recordingNote.setVisible(false);
+			return;
+		}
+		StringBuilder text = new StringBuilder("<html>Skipped while recording, already used by another override:");
+		for (Map.Entry<Integer, String> skipped : skippedRegions.entrySet())
+		{
+			text.append("<br>Region ").append(skipped.getKey()).append(" (\"")
+				.append(escapeHtml(skipped.getValue())).append("\")");
+		}
+		text.append("<br>To move one, stand in it and press + beside the override's region IDs.</html>");
+		recordingNote.setText(text.toString());
+		recordingNote.setVisible(true);
+	}
+
+	private static String escapeHtml(String value)
+	{
+		return value == null ? "" : value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+	}
+
+	/** Text of the skipped-regions note, for tests. */
+	String recordingNoteText()
+	{
+		return recordingNote.isVisible() ? recordingNote.getText() : "";
 	}
 
 	private void onGlobalMouseEvent(AWTEvent event)
@@ -265,18 +401,28 @@ final class RegionOverridePanel extends PluginPanel
 		}
 		else
 		{
+			stopRecording();
+			clearSkippedRegions();
 			recordingOverrideId = overrideId;
-			lastRecordedRegion = -1;
+			recordingProfile = plugin.profileId();
 			regionRecorder.start();
 			recordCurrentRegion();
 		}
 		reload();
 	}
 
-	private void recordCurrentRegion()
+	void recordCurrentRegion()
 	{
 		if (recordingOverrideId == null)
 		{
+			return;
+		}
+		if (plugin.profileId() != recordingProfile)
+		{
+			// The override belongs to the previous profile; never record into the new one.
+			stopRecording();
+			clearSkippedRegions();
+			reload();
 			return;
 		}
 		int regionId = plugin.currentRegionId();
@@ -285,6 +431,8 @@ final class RegionOverridePanel extends PluginPanel
 			return;
 		}
 		lastRecordedRegion = regionId;
+		// Typed but unsaved IDs count too: save them before looking for the region's owner.
+		flushAllPending();
 
 		RegionOverride target = null;
 		for (RegionOverride candidate : plugin.regionOverrides())
@@ -309,18 +457,68 @@ final class RegionOverridePanel extends PluginPanel
 		String existingOverride = plugin.regionOverrideUsing(regionId, recordingOverrideId);
 		if (existingOverride != null)
 		{
-			Object[] options = {"Skip", "Override"};
-			int choice = JOptionPane.showOptionDialog(this,
-				"Region " + regionId + " is already used by \"" + existingOverride + "\".",
-				"Region already assigned", JOptionPane.DEFAULT_OPTION, JOptionPane.WARNING_MESSAGE,
-				null, options, options[0]);
-			if (choice != 1)
+			// No dialog: this runs on a timer while the player is moving around.
+			if (!existingOverride.equals(skippedRegions.put(regionId, existingOverride)))
 			{
-				return;
+				updateRecordingNote();
+				revalidate();
+				repaint();
 			}
+			return;
 		}
-		plugin.reassignRegion(regionId, recordingOverrideId);
+		skippedRegions.remove(regionId);
+		plugin.reassignRegion(regionId, recordingOverrideId, recordingProfile);
 		reload();
+	}
+
+	/**
+	 * A number typed into a spinner is only applied on Enter or focus loss. Before the editors
+	 * are replaced, apply a valid one now; it is saved through the editor's usual profile and
+	 * ID checks, so a value typed for another profile is still dropped. Invalid text is ignored.
+	 */
+	private void commitFocusedSpinner()
+	{
+		Component focus = KeyboardFocusManager.getCurrentKeyboardFocusManager().getFocusOwner();
+		if (focus == null)
+		{
+			return;
+		}
+		JSpinner spinner = focus instanceof JSpinner ? (JSpinner) focus
+			: (JSpinner) SwingUtilities.getAncestorOfClass(JSpinner.class, focus);
+		if (spinner == null || !SwingUtilities.isDescendingFrom(spinner, this))
+		{
+			return;
+		}
+		try
+		{
+			spinner.commitEdit();
+		}
+		catch (java.text.ParseException ignored)
+		{
+			// Not a valid number: nothing to save.
+		}
+	}
+
+	/** Imports are tracked per profile, so the same built-in override in another profile is not locked. */
+	private static String importKey(long profile, String id)
+	{
+		return profile + ":" + id;
+	}
+
+	/** Saves every editor's pending typing (checked), so conflict checks see what is shown. */
+	private void flushAllPending()
+	{
+		for (OverrideEditor editor : editors)
+		{
+			editor.flushPending();
+		}
+	}
+
+	private boolean askToMoveRegions(String message)
+	{
+		Object[] options = {"Keep existing", "Move here"};
+		return JOptionPane.showOptionDialog(this, message, "Regions already assigned", JOptionPane.DEFAULT_OPTION,
+			JOptionPane.WARNING_MESSAGE, null, options, options[0]) == 1;
 	}
 
 	private enum SortOrder
@@ -349,12 +547,21 @@ final class RegionOverridePanel extends PluginPanel
 		private final JButton expandButton = iconButton("\u25b8", "Expand override");
 		private final JButton enabledButton = iconButton("", "Enable override");
 		private final JLabel nameLabel = new JLabel();
+		/** Profile this editor's override was read from; its edits are refused after a switch. */
+		private final long profile;
+		private final int editorGeneration = generation;
 		private boolean regionListTemporarilyExpanded;
-		private int importRequest;
+		/** Typed changes not yet saved, by field; each still a field-level change. */
+		private final Map<String, Consumer<RegionOverride>> pending = new LinkedHashMap<>();
+		private final Timer saveTimer = new Timer(TEXT_SAVE_DELAY_MS, event -> flushPending());
+		/** Set while code (not the user) changes a field's text, so that is not saved as typing. */
+		private boolean muted;
 
-		private OverrideEditor(RegionOverride override)
+		private OverrideEditor(RegionOverride override, long profile)
 		{
 			this.override = override;
+			this.profile = profile;
+			saveTimer.setRepeats(false);
 			setLayout(new BorderLayout());
 			setBackground(CARD_COLOR);
 			setBorder(BorderFactory.createLineBorder(ColorScheme.BORDER_COLOR));
@@ -379,8 +586,8 @@ final class RegionOverridePanel extends PluginPanel
 			updateEnabledButton();
 			enabledButton.addActionListener(event ->
 			{
-				override.enabled = !override.enabled;
-				persist();
+				boolean enabled = !override.enabled;
+				edit(target -> target.enabled = enabled);
 				nameLabel.setForeground(override.enabled ? Color.WHITE : ColorScheme.LIGHT_GRAY_COLOR);
 				updateEnabledButton();
 			});
@@ -405,7 +612,7 @@ final class RegionOverridePanel extends PluginPanel
 				expanded.remove(override.id);
 				expandedRegionLists.remove(override.id);
 				newlyAddedOverrides.remove(override.id);
-				plugin.removeRegionOverride(override.id);
+				plugin.removeRegionOverride(override.id, profile);
 				reload();
 			});
 			actions.add(remove);
@@ -427,20 +634,26 @@ final class RegionOverridePanel extends PluginPanel
 			name.setMinimumSize(new Dimension(0, 30));
 			name.getDocument().addDocumentListener(documentListener(() ->
 			{
-				override.name = name.getText();
+				if (muted)
+				{
+					return;
+				}
+				String text = name.getText();
+				editLater("name", target -> target.name = text, true);
 				if (!isDefaultOverrideName(override.name))
 				{
 					newlyAddedOverrides.remove(override.id);
 				}
 				nameLabel.setText(displayName());
-				persist();
 			}));
+			name.addActionListener(event -> flushPending());
 			name.addFocusListener(new FocusAdapter()
 			{
 				@Override
 				public void focusLost(FocusEvent event)
 				{
-					if (initiallyDefaultName && !isDefaultOverrideName(override.name)
+					flushPending();
+					if (current() && initiallyDefaultName && !isDefaultOverrideName(override.name)
 						&& sortOrder.getSelectedItem() == SortOrder.ALPHABETICAL)
 					{
 						reload();
@@ -501,16 +714,25 @@ final class RegionOverridePanel extends PluginPanel
 			};
 			regions.getDocument().addDocumentListener(documentListener(() ->
 			{
-				override.regionIds = regions.getText();
+				if (!muted)
+				{
+					String text = regions.getText();
+					editLater("regionIds", target -> target.regionIds = text, true);
+				}
 				updateRegionRows(regions, regionScroll);
-				persist();
 			}));
 			regions.addFocusListener(new FocusAdapter()
 			{
 				@Override
 				public void focusLost(FocusEvent event)
 				{
-					validateManualRegionAssignments(regions);
+					flushPending();
+					// Alt-Tab, menus and dialogs only take focus for a moment: no check then.
+					if (!event.isTemporary())
+					{
+						// After the click that moved focus has finished, which may itself reload.
+						SwingUtilities.invokeLater(() -> validateManualRegionAssignments(regions));
+					}
 				}
 			});
 			regions.addMouseListener(new MouseAdapter()
@@ -541,13 +763,34 @@ final class RegionOverridePanel extends PluginPanel
 			JTextField skybox = textField(override.skyboxFile);
 			JPanel skyboxRow = compoundField(skybox);
 			JButton browse = iconButton("\u2026", "Choose panorama file");
-			browse.addActionListener(event -> chooseSkybox(skybox));
+			browse.addActionListener(event -> chooseSkybox(skybox, browse));
 			skyboxRow.add(browse, BorderLayout.EAST);
+			boolean importing = importsInProgress.contains(importKey(profile, override.id));
+			skybox.setEnabled(!importing);
+			browse.setEnabled(!importing);
 			skybox.getDocument().addDocumentListener(documentListener(() ->
 			{
-				override.skyboxFile = skybox.getText();
-				persist();
+				if (muted)
+				{
+					return;
+				}
+				// A path is only tried once complete: saved on Enter or focus loss, not per key.
+				String text = skybox.getText();
+				editLater("skyboxFile", target -> target.skyboxFile = text, false);
 			}));
+			skybox.addActionListener(event -> flushPending());
+			skybox.addFocusListener(new FocusAdapter()
+			{
+				@Override
+				public void focusLost(FocusEvent event)
+				{
+					// Not on a temporary loss: opening the file chooser must not save a half-typed path.
+					if (!event.isTemporary())
+					{
+						flushPending();
+					}
+				}
+			});
 			addField(5, "Custom sky", skyboxRow);
 
 			JComboBox<GpuSkyExtensionConfig.RegionWeatherOverride> weather =
@@ -557,16 +800,17 @@ final class RegionOverridePanel extends PluginPanel
 			weather.setFocusable(false);
 			weather.addActionListener(event ->
 			{
-				override.weather = (GpuSkyExtensionConfig.RegionWeatherOverride) weather.getSelectedItem();
-				persist();
+				GpuSkyExtensionConfig.RegionWeatherOverride value =
+					(GpuSkyExtensionConfig.RegionWeatherOverride) weather.getSelectedItem();
+				edit(target -> target.weather = value);
 			});
 			addField(2, "Weather", weather);
 
 			JSpinner intensity = percentageSpinner(override.weatherIntensity, JTextField.LEFT);
 			intensity.addChangeListener(event ->
 			{
-				override.weatherIntensity = (Integer) intensity.getValue();
-				persist();
+				int value = (Integer) intensity.getValue();
+				edit(target -> target.weatherIntensity = value);
 			});
 			addField(3, "Intensity", intensity);
 
@@ -577,8 +821,8 @@ final class RegionOverridePanel extends PluginPanel
 			skyboxImage.setFocusable(false);
 			skyboxImage.addActionListener(event ->
 			{
-				override.skyboxImage = (GpuSkyExtensionConfig.SkyboxImage) skyboxImage.getSelectedItem();
-				persist();
+				GpuSkyExtensionConfig.SkyboxImage value = (GpuSkyExtensionConfig.SkyboxImage) skyboxImage.getSelectedItem();
+				edit(target -> target.skyboxImage = value);
 			});
 			addField(4, "Skybox preset", skyboxImage);
 
@@ -599,29 +843,29 @@ final class RegionOverridePanel extends PluginPanel
 			JSpinner fov = new JSpinner(new SpinnerNumberModel(override.horizontalFov, 60, 120, 1));
 			fov.addChangeListener(event ->
 			{
-				override.horizontalFov = (Integer) fov.getValue();
-				persist();
+				int value = (Integer) fov.getValue();
+				edit(target -> target.horizontalFov = value);
 			});
 			addSettingField(customSkySettings, 0, "FOV", fov);
 			JSpinner yaw = new JSpinner(new SpinnerNumberModel(override.yawOffset, -180, 180, 1));
 			yaw.addChangeListener(event ->
 			{
-				override.yawOffset = (Integer) yaw.getValue();
-				persist();
+				int value = (Integer) yaw.getValue();
+				edit(target -> target.yawOffset = value);
 			});
 			addSettingField(customSkySettings, 1, "Horizontal", yaw);
 			JSpinner pitch = new JSpinner(new SpinnerNumberModel(override.pitchOffset, -10, 10, 1));
 			pitch.addChangeListener(event ->
 			{
-				override.pitchOffset = (Integer) pitch.getValue();
-				persist();
+				int value = (Integer) pitch.getValue();
+				edit(target -> target.pitchOffset = value);
 			});
 			addSettingField(customSkySettings, 2, "Vertical", pitch);
 			JSpinner exposure = new JSpinner(new SpinnerNumberModel(override.exposure, 10, 300, 5));
 			exposure.addChangeListener(event ->
 			{
-				override.exposure = (Integer) exposure.getValue();
-				persist();
+				int value = (Integer) exposure.getValue();
+				edit(target -> target.exposure = value);
 			});
 			addSettingField(customSkySettings, 3, "Exposure", exposure);
 			GridBagConstraints customConstraints = new GridBagConstraints();
@@ -634,9 +878,9 @@ final class RegionOverridePanel extends PluginPanel
 			customSkySettings.setVisible(!override.inheritSkySettings);
 			inherit.addActionListener(event ->
 			{
-				override.inheritSkySettings = inherit.isSelected();
+				boolean value = inherit.isSelected();
+				edit(target -> target.inheritSkySettings = value);
 				customSkySettings.setVisible(!override.inheritSkySettings);
-				persist();
 				body.revalidate();
 			});
 
@@ -657,36 +901,36 @@ final class RegionOverridePanel extends PluginPanel
 			JSpinner worldLighting = percentageSpinner(override.worldLighting);
 			worldLighting.addChangeListener(event ->
 			{
-				override.worldLighting = (Integer) worldLighting.getValue();
-				persist();
+				int value = (Integer) worldLighting.getValue();
+				edit(target -> target.worldLighting = value);
 			});
 			addSettingField(customLightSettings, 0, "World", worldLighting);
 			JSpinner rimLighting = percentageSpinner(override.rimLighting);
 			rimLighting.addChangeListener(event ->
 			{
-				override.rimLighting = (Integer) rimLighting.getValue();
-				persist();
+				int value = (Integer) rimLighting.getValue();
+				edit(target -> target.rimLighting = value);
 			});
 			addSettingField(customLightSettings, 1, "Rim", rimLighting);
 			JSpinner backlighting = percentageSpinner(override.backlighting);
 			backlighting.addChangeListener(event ->
 			{
-				override.backlighting = (Integer) backlighting.getValue();
-				persist();
+				int value = (Integer) backlighting.getValue();
+				edit(target -> target.backlighting = value);
 			});
 			addSettingField(customLightSettings, 2, "Backlight", backlighting);
 			JSpinner skyboxTint = percentageSpinner(override.skyboxTint);
 			skyboxTint.addChangeListener(event ->
 			{
-				override.skyboxTint = (Integer) skyboxTint.getValue();
-				persist();
+				int value = (Integer) skyboxTint.getValue();
+				edit(target -> target.skyboxTint = value);
 			});
 			addSettingField(customLightSettings, 3, "Tint", skyboxTint);
 			JSpinner atmosphere = percentageSpinner(override.atmosphere);
 			atmosphere.addChangeListener(event ->
 			{
-				override.atmosphere = (Integer) atmosphere.getValue();
-				persist();
+				int value = (Integer) atmosphere.getValue();
+				edit(target -> target.atmosphere = value);
 			});
 			addSettingField(customLightSettings, 4, "Atmosphere", atmosphere);
 			GridBagConstraints customLightConstraints = new GridBagConstraints();
@@ -699,9 +943,9 @@ final class RegionOverridePanel extends PluginPanel
 			customLightSettings.setVisible(!override.inheritLightSettings);
 			inheritLights.addActionListener(event ->
 			{
-				override.inheritLightSettings = inheritLights.isSelected();
+				boolean value = inheritLights.isSelected();
+				edit(target -> target.inheritLightSettings = value);
 				customLightSettings.setVisible(!override.inheritLightSettings);
-				persist();
 				body.revalidate();
 			});
 
@@ -739,8 +983,9 @@ final class RegionOverridePanel extends PluginPanel
 				{
 					if (!SwingUtilities.isLeftMouseButton(event)) return; // right-click shows Reset
 					Color start = override.customWaterColor() != null ? override.customWaterColor() : plugin.mainWaterColor();
-					net.runelite.client.ui.components.colorpicker.RuneliteColorPicker picker =
+					RuneliteColorPicker picker =
 						plugin.colorPickerManager().create(RegionOverridePanel.this, start, "Water color", true);
+					openPicker = picker;
 					picker.setLocationRelativeTo(waterColor);
 					picker.setOnColorChange(color ->
 					{
@@ -749,9 +994,18 @@ final class RegionOverridePanel extends PluginPanel
 					});
 					picker.setOnClose(color ->
 					{
-						override.waterColor = RegionOverride.formatWaterColor(color);
+						if (openPicker == picker)
+						{
+							openPicker = null;
+						}
+						String value = RegionOverride.formatWaterColor(color);
+						edit(target -> target.waterColor = value);
 						showWaterColor.run();
-						persist();
+						if (!current() && !disposed)
+						{
+							// The list was rebuilt while the picker was open; show the saved color there.
+							reload();
+						}
 					});
 					picker.setVisible(true);
 				}
@@ -759,9 +1013,9 @@ final class RegionOverridePanel extends PluginPanel
 			// Reset to the default water color (button, or right-click like the config panel).
 			Runnable resetWaterColor = () ->
 			{
-				override.waterColor = RegionOverride.formatWaterColor(com.endrit.gpusky.water.WaterConfig.DEFAULT_WATER_COLOR);
+				String value = RegionOverride.formatWaterColor(com.endrit.gpusky.water.WaterConfig.DEFAULT_WATER_COLOR);
+				edit(target -> target.waterColor = value);
 				showWaterColor.run();
-				persist();
 			};
 			javax.swing.JPopupMenu waterColorMenu = new javax.swing.JPopupMenu();
 			javax.swing.JMenuItem resetItem = new javax.swing.JMenuItem("Reset");
@@ -786,10 +1040,10 @@ final class RegionOverridePanel extends PluginPanel
 			inheritWater.addActionListener(event ->
 			{
 				// Unticking starts from the current main color; ticking clears the custom color.
-				override.waterColor = inheritWater.isSelected() ? "" : RegionOverride.formatWaterColor(plugin.mainWaterColor());
+				String value = inheritWater.isSelected() ? "" : RegionOverride.formatWaterColor(plugin.mainWaterColor());
+				edit(target -> target.waterColor = value);
 				customWaterSettings.setVisible(!inheritWater.isSelected());
 				showWaterColor.run();
-				persist();
 				body.revalidate();
 			});
 		}
@@ -804,11 +1058,12 @@ final class RegionOverridePanel extends PluginPanel
 			String value = regions.getText().trim();
 			for (String token : value.split("[,\\s]+"))
 			{
-				if (Integer.toString(regionId).equals(token))
+				if (RegionOverride.isRegion(token, regionId))
 				{
 					return;
 				}
 			}
+			flushAllPending(); // Other overrides' typed IDs count as used.
 			String existingOverride = plugin.regionOverrideUsing(regionId, override.id);
 			if (existingOverride != null)
 			{
@@ -819,12 +1074,20 @@ final class RegionOverridePanel extends PluginPanel
 					null, options, options[0]);
 				if (choice == 1)
 				{
-					plugin.reassignRegion(regionId, override.id);
+					plugin.reassignRegion(regionId, override.id, profile);
 					reload();
 				}
 				return;
 			}
-			regions.setText(formatRegionIds(value + " " + regionId));
+			setRegionIds(regions, formatRegionIds(value + " " + regionId));
+		}
+
+		/** A change made by a button, not typing: shown and saved once, with no empty intermediate save. */
+		private void setRegionIds(JTextArea regions, String text)
+		{
+			setQuietly(regions, text);
+			pending.remove("regionIds");
+			edit(target -> target.regionIds = text);
 		}
 
 		private void removeCurrentRegion(JTextArea regions)
@@ -834,11 +1097,10 @@ final class RegionOverridePanel extends PluginPanel
 			{
 				return;
 			}
-			String current = Integer.toString(regionId);
 			StringBuilder remaining = new StringBuilder();
 			for (String token : regions.getText().trim().split("[,\\s]+"))
 			{
-				if (!token.isEmpty() && !current.equals(token))
+				if (!token.isEmpty() && !RegionOverride.isRegion(token, regionId))
 				{
 					if (remaining.length() > 0)
 					{
@@ -847,22 +1109,75 @@ final class RegionOverridePanel extends PluginPanel
 					remaining.append(token);
 				}
 			}
-			regions.setText(formatRegionIds(remaining.toString()));
+			setRegionIds(regions, formatRegionIds(remaining.toString()));
 		}
 
+		/**
+		 * One dialog for all region IDs in this field that another override already uses. Runs
+		 * after a permanent focus loss, never while another such dialog is open, and checks the
+		 * panel, profile and text again after the dialog, before changing anything.
+		 */
 		private void validateManualRegionAssignments(JTextArea regions)
 		{
-			List<Integer> conflicts = new ArrayList<>();
-			Set<Integer> seen = new HashSet<>();
-			for (String token : regions.getText().trim().split("[,\\s]+"))
+			// A replaced editor, or one for another profile, asks nothing.
+			if (!current() || validatingRegions || plugin.profileId() != profile)
+			{
+				return;
+			}
+			// Saved lists then match what is shown, here and in the other editors.
+			flushAllPending();
+			String text = regions.getText();
+			Map<Integer, String> conflicts = regionConflicts(text);
+			if (conflicts.isEmpty())
+			{
+				return;
+			}
+			boolean moveHere;
+			validatingRegions = true;
+			try
+			{
+				moveHere = conflictPrompt.moveHere(conflictMessage(conflicts));
+			}
+			finally
+			{
+				validatingRegions = false;
+			}
+			if (!current() || plugin.profileId() != profile || !text.equals(regions.getText()))
+			{
+				return; // Rebuilt, switched or edited while the dialog was open.
+			}
+			Map<Integer, String> remaining = regionConflicts(text);
+			if (remaining.isEmpty())
+			{
+				return;
+			}
+			if (moveHere)
+			{
+				for (int regionId : remaining.keySet())
+				{
+					plugin.reassignRegion(regionId, override.id, profile);
+				}
+				reload();
+				return;
+			}
+			setRegionIds(regions, formatRegionIds(withoutRegions(text, remaining.keySet())));
+		}
+
+		private Map<Integer, String> regionConflicts(String text)
+		{
+			Map<Integer, String> conflicts = new LinkedHashMap<>();
+			for (String token : text.trim().split("[,\\s]+"))
 			{
 				try
 				{
 					int regionId = Integer.parseInt(token);
-					if (regionId >= 0 && regionId <= 65535 && seen.add(regionId)
-						&& plugin.regionOverrideUsing(regionId, override.id) != null)
+					if (regionId >= 0 && regionId <= 65535 && !conflicts.containsKey(regionId))
 					{
-						conflicts.add(regionId);
+						String owner = plugin.regionOverrideUsing(regionId, override.id);
+						if (owner != null)
+						{
+							conflicts.put(regionId, owner);
+						}
 					}
 				}
 				catch (NumberFormatException ignored)
@@ -870,66 +1185,55 @@ final class RegionOverridePanel extends PluginPanel
 					// Invalid text remains visible but cannot conflict with a region assignment.
 				}
 			}
+			return conflicts;
+		}
 
-			if (conflicts.isEmpty())
+		private String conflictMessage(Map<Integer, String> conflicts)
+		{
+			boolean one = conflicts.size() == 1;
+			StringBuilder message = new StringBuilder(one
+				? "This region is already used by another override:"
+				: "These regions are already used by other overrides:");
+			int listed = 0;
+			for (Map.Entry<Integer, String> conflict : conflicts.entrySet())
 			{
-				return;
+				if (listed++ == MAX_LISTED_CONFLICTS)
+				{
+					message.append("\n  ...and ").append(conflicts.size() - MAX_LISTED_CONFLICTS).append(" more");
+					break;
+				}
+				message.append("\n  Region ").append(conflict.getKey())
+					.append(" (\"").append(conflict.getValue()).append("\")");
 			}
+			message.append("\n\nMove ").append(one ? "it" : "them").append(" to \"").append(displayName())
+				.append("\", or keep ").append(one ? "it where it is" : "them where they are").append('?');
+			return message.toString();
+		}
 
-			Set<Integer> rejected = new HashSet<>();
-			boolean reassigned = false;
-			for (int regionId : conflicts)
+		private String withoutRegions(String text, Set<Integer> removed)
+		{
+			StringBuilder remaining = new StringBuilder();
+			for (String token : text.trim().split("[,\\s]+"))
 			{
-				String existingOverride = plugin.regionOverrideUsing(regionId, override.id);
-				if (existingOverride == null)
+				boolean remove = false;
+				try
 				{
-					continue;
+					remove = removed.contains(Integer.parseInt(token));
 				}
-				Object[] options = {"Keep existing", "Move here"};
-				int choice = JOptionPane.showOptionDialog(this,
-					"Region " + regionId + " is already used by \"" + existingOverride + "\".",
-					"Region already assigned", JOptionPane.DEFAULT_OPTION, JOptionPane.WARNING_MESSAGE,
-					null, options, options[0]);
-				if (choice == 1)
+				catch (NumberFormatException ignored)
 				{
-					plugin.reassignRegion(regionId, override.id);
-					reassigned = true;
+					// Preserve invalid text so the user can correct it.
 				}
-				else
+				if (!remove && !token.isEmpty())
 				{
-					rejected.add(regionId);
+					if (remaining.length() > 0)
+					{
+						remaining.append(' ');
+					}
+					remaining.append(token);
 				}
 			}
-
-			if (!rejected.isEmpty())
-			{
-				StringBuilder remaining = new StringBuilder();
-				for (String token : regions.getText().trim().split("[,\\s]+"))
-				{
-					boolean remove = false;
-					try
-					{
-						remove = rejected.contains(Integer.parseInt(token));
-					}
-					catch (NumberFormatException ignored)
-					{
-						// Preserve invalid text so the user can correct it.
-					}
-					if (!remove)
-					{
-						if (remaining.length() > 0)
-						{
-							remaining.append(' ');
-						}
-						remaining.append(token);
-					}
-				}
-				regions.setText(formatRegionIds(remaining.toString()));
-			}
-			if (reassigned)
-			{
-				reload();
-			}
+			return remaining.toString();
 		}
 
 		private void updateRegionRows(JTextArea regions, JScrollPane regionScroll)
@@ -1051,8 +1355,12 @@ final class RegionOverridePanel extends PluginPanel
 			}
 		}
 
-		private void chooseSkybox(JTextField skybox)
+		private void chooseSkybox(JTextField skybox, JButton browse)
 		{
+			if (importsInProgress.contains(importKey(profile, override.id)))
+			{
+				return;
+			}
 			Filepath.Chooser chooser = new Filepath.Chooser().setIsOpen().setAcceptsFiles()
 				.setDialogTitle("Choose region panorama")
 				.addExtensionFilter("Panorama images", "png", "jpg", "jpeg");
@@ -1062,30 +1370,62 @@ final class RegionOverridePanel extends PluginPanel
 				chooser.setCurrentDirectory(directory);
 			}
 			List<Filepath> selected = chooser.showDialog(RegionOverridePanel.this);
-			if (selected == null || selected.isEmpty())
+			if (selected == null || selected.isEmpty() || disposed)
 			{
 				return;
 			}
-			int request = ++importRequest;
+			String id = override.id;
+			// The chosen file replaces any path typed but not yet saved.
+			pending.remove("skyboxFile");
+			String importKey = importKey(profile, id);
+			importsInProgress.add(importKey);
 			skybox.setEnabled(false);
-			plugin.importSkybox(selected.get(0), override.id).whenComplete((path, failure) ->
+			browse.setEnabled(false);
+			// The plugin assigns the imported file to the override by ID when it finishes.
+			plugin.importSkybox(selected.get(0), id, profile).whenComplete((path, failure) ->
 				SwingUtilities.invokeLater(() ->
 			{
-				if (disposed || request != importRequest
-					|| !SwingUtilities.isDescendingFrom(skybox, RegionOverridePanel.this))
+				importsInProgress.remove(importKey);
+				if (disposed)
 				{
 					return;
 				}
-				skybox.setEnabled(true);
-				if (failure == null)
-				{
-					skybox.setText(path);
-				}
-				else
+				// Only for the profile that started it; another profile never asked for this import.
+				if (failure != null && plugin.profileId() == profile)
 				{
 					Throwable cause = failure.getCause() == null ? failure : failure.getCause();
 					JOptionPane.showMessageDialog(RegionOverridePanel.this, cause.getMessage(),
 						"Unable to import panorama", JOptionPane.ERROR_MESSAGE);
+				}
+				if (current())
+				{
+					skybox.setEnabled(true);
+					browse.setEnabled(true);
+					if (failure == null)
+					{
+						// The plugin already saved it by ID; showing it is not a new edit.
+						override.skyboxFile = path;
+						pending.remove("skyboxFile");
+						setQuietly(skybox, path);
+					}
+					else
+					{
+						// Show what is actually saved (read fresh by ID), not the typed path that was dropped.
+						for (RegionOverride saved : plugin.regionOverrides())
+						{
+							if (saved.id.equals(id))
+							{
+								override.skyboxFile = saved.skyboxFile;
+								setQuietly(skybox, saved.skyboxFile == null ? "" : saved.skyboxFile);
+								break;
+							}
+						}
+					}
+				}
+				else
+				{
+					// This editor was replaced during the import; rebuild so the new one shows the result.
+					reload();
 				}
 			}));
 		}
@@ -1125,9 +1465,75 @@ final class RegionOverridePanel extends PluginPanel
 			return name.isEmpty() ? "Unnamed override" : name;
 		}
 
-		private void persist()
+		/** Whether this editor is from the latest reload, so it is the one shown. */
+		private boolean current()
 		{
-			plugin.updateRegionOverride(override);
+			return editorGeneration == generation && !disposed;
+		}
+
+		/**
+		 * Applies one field change to this editor's copy and to the saved override with the same
+		 * ID, so the other fields are never written back from an older copy. The change must only
+		 * assign values already worked out, because it runs on both copies.
+		 */
+		private void edit(Consumer<RegionOverride> change)
+		{
+			change.accept(override);
+			if (!disposed)
+			{
+				plugin.updateRegionOverride(override.id, profile, change);
+			}
+		}
+
+		/**
+		 * Typing: shown in this editor at once, saved later as one field-level change: after
+		 * TEXT_SAVE_DELAY_MS without typing ({@code timed}), or on Enter, focus loss or reload.
+		 */
+		private void editLater(String field, Consumer<RegionOverride> change, boolean timed)
+		{
+			change.accept(override);
+			pending.put(field, change);
+			if (timed)
+			{
+				saveTimer.restart();
+			}
+		}
+
+		/** Saves pending typing; after a profile switch it is dropped, because it belongs to the other profile. */
+		private void flushPending()
+		{
+			saveTimer.stop();
+			if (pending.isEmpty())
+			{
+				return;
+			}
+			List<Consumer<RegionOverride>> changes = new ArrayList<>(pending.values());
+			pending.clear();
+			if (disposed || plugin.profileId() != profile)
+			{
+				return;
+			}
+			plugin.updateRegionOverride(override.id, profile, target ->
+			{
+				for (Consumer<RegionOverride> change : changes)
+				{
+					change.accept(target);
+				}
+			});
+		}
+
+		/** Sets text without it being saved as typing (the change is saved by the caller, if at all). */
+		private void setQuietly(JTextComponent field, String text)
+		{
+			muted = true;
+			try
+			{
+				field.setText(text);
+			}
+			finally
+			{
+				muted = false;
+			}
 		}
 	}
 

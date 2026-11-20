@@ -1,6 +1,9 @@
 package com.endrit.gpusky;
 
 import java.awt.image.BufferedImage;
+import java.awt.image.DataBufferByte;
+import java.awt.image.PixelInterleavedSampleModel;
+import java.awt.image.Raster;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
@@ -13,9 +16,12 @@ import org.lwjgl.opengl.GL33C;
 final class OpenGlContext
 {
 	static final int VERTEX_STRIDE_FLOATS = 13;
-	private static final int MAX_TEXTURES = 6;
+	// Units 0..5: sky and terrain data for the scene shader; unit 6: weather particles.
+	private static final int MAX_TEXTURES = 7;
 	// Keep sky/terrain samplers separate from Water's scene and transparency slots (4-12).
 	private static final int FIRST_TEXTURE_UNIT = 16;
+	// Small upload copies (weather atlases) are reused; a large one is released after use.
+	private static final int RETAINED_STAGING_BYTES = 16 * 1024 * 1024;
 
 	private final Client client;
 	private final Map<Integer, Texture> textures = new HashMap<>();
@@ -59,7 +65,7 @@ final class OpenGlContext
 			GL33C.glTexParameteri(GL33C.GL_TEXTURE_2D, GL33C.GL_TEXTURE_MAG_FILTER, GL33C.GL_LINEAR);
 			uploadTexture(texture, image, origin, filter);
 			int handle = nextHandle++;
-			textures.put(handle, new Texture(texture, origin, filter));
+			textures.put(handle, new Texture(texture, origin, filter, image.getWidth()));
 			return handle;
 		}
 		catch (RuntimeException | Error ex)
@@ -78,6 +84,14 @@ final class OpenGlContext
 		checkActive();
 		Texture target = textureResource(texture);
 		uploadTexture(target.id, image, target.origin, target.filter);
+		target.width = image.getWidth();
+	}
+
+	/** Width in pixels of an uploaded image texture (0 for unknown handles). */
+	int textureWidth(int texture)
+	{
+		Texture target = textures.get(texture);
+		return target == null ? 0 : target.width;
 	}
 
 	void destroyTexture(int texture)
@@ -104,7 +118,7 @@ final class OpenGlContext
 			GL33C.glTexParameteri(GL33C.GL_TEXTURE_2D, GL33C.GL_TEXTURE_MAG_FILTER, GL33C.GL_LINEAR);
 			uploadFloatTexture(texture, width, height, rgba);
 			int handle = nextHandle++;
-			textures.put(handle, new Texture(texture, TextureOrigin.TOP_LEFT, Filter.LINEAR));
+			textures.put(handle, new Texture(texture, TextureOrigin.TOP_LEFT, Filter.LINEAR, width));
 			return handle;
 		}
 		catch (RuntimeException | Error ex)
@@ -284,7 +298,13 @@ final class OpenGlContext
 				GL33C.glPolygonOffset(0f, 1f);
 			}
 		}
-		if (blend == Blend.ADDITIVE)
+		if (blend == Blend.SCREEN)
+		{
+			// Colour arrives multiplied by its alpha: result = source + destination * (1 - source),
+			// so bright areas gain less and nothing clips to white.
+			GL33C.glBlendFuncSeparate(GL33C.GL_ONE, GL33C.GL_ONE_MINUS_SRC_COLOR, GL33C.GL_ONE, GL33C.GL_ONE);
+		}
+		else if (blend == Blend.ADDITIVE)
 		{
 			GL33C.glBlendFuncSeparate(GL33C.GL_SRC_ALPHA, GL33C.GL_ONE, GL33C.GL_ONE, GL33C.GL_ONE);
 		}
@@ -442,8 +462,37 @@ final class OpenGlContext
 			throw new IllegalArgumentException("Unsupported texture dimensions: " + width + "x" + height
 				+ " (GPU maximum " + maximum + ")");
 		}
+		int previousTexture = GL33C.glGetInteger(GL33C.GL_TEXTURE_BINDING_2D);
+		try
+		{
+			GL33C.glBindTexture(GL33C.GL_TEXTURE_2D, texture);
+			// Decoded JPEG panoramas go straight from the image's own bytes; no per-pixel
+			// conversion on the client thread and no extra full-size copy in Java memory.
+			if (!uploadBgrImage(image, origin, width, height))
+			{
+				uploadConvertedImage(image, origin, width, height, (int) size);
+			}
+			if (GL33C.glGetTexLevelParameteri(GL33C.GL_TEXTURE_2D, 0, GL33C.GL_TEXTURE_WIDTH) != width
+				|| GL33C.glGetTexLevelParameteri(GL33C.GL_TEXTURE_2D, 0, GL33C.GL_TEXTURE_HEIGHT) != height)
+			{
+				throw new IllegalStateException("GPU could not allocate texture " + width + "x" + height);
+			}
+			if (filter == Filter.MIPMAP_LINEAR)
+			{
+				GL33C.glGenerateMipmap(GL33C.GL_TEXTURE_2D);
+			}
+		}
+		finally
+		{
+			GL33C.glBindTexture(GL33C.GL_TEXTURE_2D, previousTexture);
+		}
+	}
+
+	/** The existing per-pixel RGBA copy, for image types without a direct upload path. */
+	private void uploadConvertedImage(BufferedImage image, TextureOrigin origin, int width, int height, int size)
+	{
 		int[] argb = new int[width];
-		ByteBuffer pixels = textureStaging((int) size);
+		ByteBuffer pixels = textureStaging(size);
 		pixels.clear();
 		for (int row = 0; row < height; ++row)
 		{
@@ -459,26 +508,96 @@ final class OpenGlContext
 			}
 		}
 		pixels.flip();
-		int previousTexture = GL33C.glGetInteger(GL33C.GL_TEXTURE_BINDING_2D);
+		GL33C.glTexImage2D(GL33C.GL_TEXTURE_2D, 0, GL33C.GL_RGBA8, width, height, 0,
+			GL33C.GL_RGBA, GL33C.GL_UNSIGNED_BYTE, pixels);
+		if (textureStaging != null && textureStaging.capacity() > RETAINED_STAGING_BYTES)
+		{
+			// Do not keep a panorama-sized direct buffer for the rest of the session.
+			textureStaging = null;
+		}
+	}
+
+	/**
+	 * Uploads a TYPE_3BYTE_BGR image (what ImageIO decodes JPEGs to) through a temporary
+	 * pixel buffer object, copying whole rows from the image's own byte array. Returns
+	 * false, without changing the texture, when the image has another layout.
+	 */
+	private static boolean uploadBgrImage(BufferedImage image, TextureOrigin origin, int width, int height)
+	{
+		byte[] data = bgrBytes(image, width, height);
+		if (data == null)
+		{
+			return false;
+		}
+		int rowBytes = width * 3;
+		long size = (long) rowBytes * height;
+		int previousUnpackBuffer = GL33C.glGetInteger(GL33C.GL_PIXEL_UNPACK_BUFFER_BINDING);
+		int previousAlignment = GL33C.glGetInteger(GL33C.GL_UNPACK_ALIGNMENT);
+		int previousRowLength = GL33C.glGetInteger(GL33C.GL_UNPACK_ROW_LENGTH);
+		int previousSkipRows = GL33C.glGetInteger(GL33C.GL_UNPACK_SKIP_ROWS);
+		int previousSkipPixels = GL33C.glGetInteger(GL33C.GL_UNPACK_SKIP_PIXELS);
+		int pbo = GL33C.glGenBuffers();
 		try
 		{
-			GL33C.glBindTexture(GL33C.GL_TEXTURE_2D, texture);
-			GL33C.glTexImage2D(GL33C.GL_TEXTURE_2D, 0, GL33C.GL_RGBA8, width, height, 0,
-				GL33C.GL_RGBA, GL33C.GL_UNSIGNED_BYTE, pixels);
-			if (GL33C.glGetTexLevelParameteri(GL33C.GL_TEXTURE_2D, 0, GL33C.GL_TEXTURE_WIDTH) != width
-				|| GL33C.glGetTexLevelParameteri(GL33C.GL_TEXTURE_2D, 0, GL33C.GL_TEXTURE_HEIGHT) != height)
+			GL33C.glBindBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER, pbo);
+			GL33C.glBufferData(GL33C.GL_PIXEL_UNPACK_BUFFER, size, GL33C.GL_STREAM_DRAW);
+			ByteBuffer mapped = GL33C.glMapBufferRange(GL33C.GL_PIXEL_UNPACK_BUFFER, 0, size,
+				GL33C.GL_MAP_WRITE_BIT | GL33C.GL_MAP_INVALIDATE_BUFFER_BIT);
+			if (mapped == null)
 			{
-				throw new IllegalStateException("GPU could not allocate texture " + width + "x" + height);
+				return false;
 			}
-			if (filter == Filter.MIPMAP_LINEAR)
+			for (int row = 0; row < height; ++row)
 			{
-				GL33C.glGenerateMipmap(GL33C.GL_TEXTURE_2D);
+				int y = origin == TextureOrigin.BOTTOM_LEFT ? height - 1 - row : row;
+				mapped.put(data, y * rowBytes, rowBytes);
 			}
+			if (!GL33C.glUnmapBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER))
+			{
+				return false; // Contents were lost; use the copy path instead.
+			}
+			GL33C.glPixelStorei(GL33C.GL_UNPACK_ALIGNMENT, 1);
+			GL33C.glPixelStorei(GL33C.GL_UNPACK_ROW_LENGTH, 0);
+			GL33C.glPixelStorei(GL33C.GL_UNPACK_SKIP_ROWS, 0);
+			GL33C.glPixelStorei(GL33C.GL_UNPACK_SKIP_PIXELS, 0);
+			GL33C.glTexImage2D(GL33C.GL_TEXTURE_2D, 0, GL33C.GL_RGB8, width, height, 0,
+				GL33C.GL_BGR, GL33C.GL_UNSIGNED_BYTE, 0L);
+			return true;
 		}
 		finally
 		{
-			GL33C.glBindTexture(GL33C.GL_TEXTURE_2D, previousTexture);
+			GL33C.glBindBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER, previousUnpackBuffer);
+			GL33C.glDeleteBuffers(pbo);
+			GL33C.glPixelStorei(GL33C.GL_UNPACK_ALIGNMENT, previousAlignment);
+			GL33C.glPixelStorei(GL33C.GL_UNPACK_ROW_LENGTH, previousRowLength);
+			GL33C.glPixelStorei(GL33C.GL_UNPACK_SKIP_ROWS, previousSkipRows);
+			GL33C.glPixelStorei(GL33C.GL_UNPACK_SKIP_PIXELS, previousSkipPixels);
 		}
+	}
+
+	/** The packed B,G,R bytes of a plain TYPE_3BYTE_BGR image, or null for any other layout. */
+	static byte[] bgrBytes(BufferedImage image, int width, int height)
+	{
+		if (image.getType() != BufferedImage.TYPE_3BYTE_BGR)
+		{
+			return null;
+		}
+		Raster raster = image.getRaster();
+		if (!(raster.getDataBuffer() instanceof DataBufferByte)
+			|| !(raster.getSampleModel() instanceof PixelInterleavedSampleModel))
+		{
+			return null;
+		}
+		DataBufferByte buffer = (DataBufferByte) raster.getDataBuffer();
+		PixelInterleavedSampleModel model = (PixelInterleavedSampleModel) raster.getSampleModel();
+		int[] offsets = model.getBandOffsets();
+		boolean packed = buffer.getNumBanks() == 1 && buffer.getOffset() == 0
+			&& raster.getSampleModelTranslateX() == 0 && raster.getSampleModelTranslateY() == 0
+			&& raster.getWidth() == width && raster.getHeight() == height
+			&& model.getPixelStride() == 3 && model.getScanlineStride() == width * 3
+			&& offsets.length == 3 && offsets[0] == 2 && offsets[1] == 1 && offsets[2] == 0;
+		byte[] data = buffer.getData();
+		return packed && data.length >= (long) width * height * 3 ? data : null;
 	}
 
 	private void uploadFloatTexture(int texture, int width, int height, float[] rgba)
@@ -581,7 +700,7 @@ final class OpenGlContext
 		return shader;
 	}
 
-	// Texture units 2..7 carry our scene uniforms through the subsequent world draw.
+	// Texture units 16..21 carry our scene uniforms through the subsequent world draw.
 	// Restore the other state changed by sky/weather drawing to its incoming values.
 	static final class DrawState
 	{
@@ -647,12 +766,14 @@ final class OpenGlContext
 		private final int id;
 		private final TextureOrigin origin;
 		private final Filter filter;
+		private int width;
 
-		private Texture(int id, TextureOrigin origin, Filter filter)
+		private Texture(int id, TextureOrigin origin, Filter filter, int width)
 		{
 			this.id = id;
 			this.origin = origin;
 			this.filter = filter;
+			this.width = width;
 		}
 	}
 
@@ -711,7 +832,8 @@ final class OpenGlContext
 	enum Blend
 	{
 		ALPHA,
-		ADDITIVE
+		ADDITIVE,
+		SCREEN
 	}
 
 }

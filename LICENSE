@@ -23,3 +23,23 @@ SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
 CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+-------------------------------------------------------------------------------
+
+SKYBOX PRESET IMAGES (NOT COVERED BY THE LICENSE ABOVE)
+
+The BSD 2-Clause License above does not apply to the following eleven files
+("Skybox Images"), all located in
+src/main/resources/com/endrit/gpusky/assets/weather/presets/:
+
+  Ashfall.jpg, Bloodfall.jpg, Blossom.jpg, Cox.jpg, Daylight.jpg,
+  Moonlight.jpg, Rain.jpg, Sandstorm.jpg, Snow.jpg, Sunlight.jpg, TFA.jpg
+
+Copyright (c) 2026, Endrit
+All rights reserved.
+
+The Skybox Images may be used only as part of the unmodified "Skybox for GPU"
+plugin, as distributed through the RuneLite Plugin Hub or this repository. No
+other permission is granted. Without prior written permission from the
+copyright holder you may not copy, extract, modify, redistribute, sell, or use
+the Skybox Images in any other project, plugin, client, or product.

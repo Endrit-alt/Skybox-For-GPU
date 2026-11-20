@@ -11,7 +11,6 @@ import java.util.function.Consumer;
 import net.runelite.api.Client;
 import net.runelite.api.Constants;
 import net.runelite.api.Perspective;
-import net.runelite.api.Player;
 import net.runelite.api.Scene;
 import net.runelite.api.WorldView;
 import net.runelite.api.coords.LocalPoint;
@@ -29,6 +28,9 @@ final class GpuSkyExtension extends GpuExtension
 	private static final int SCENE_OFFSET = (Constants.EXTENDED_SCENE_SIZE - Constants.SCENE_SIZE) / 2;
 	private static final float TERRAIN_HEIGHT_TOLERANCE = 1f;
 	private static final float EDGE_LIGHT_BASE_SCALE = 1.4f;
+	// Scene lighting samples the sky through a mip level about this wide, whatever the
+	// texture resolution (64 = mip 7 of an 8192-wide panorama, the previous fixed level).
+	private static final float LIGHTING_SAMPLE_WIDTH = 64f;
 	// Preserve the wide framing calibrated at 106% resizable scaling without depending on stretching.
 	private static final float REFERENCE_SCALE_RATIO = 0.26219955f * 2.06f;
 	private static final float REFERENCE_ASPECT_RATIO = 512f / 334f;
@@ -43,6 +45,7 @@ final class GpuSkyExtension extends GpuExtension
 		"}");
 	private static final String FRAGMENT_SHADER = String.join("\n",
 		"#version 330",
+		SkyboxColorAdjustment.GLSL,
 		"layout(std140) uniform uniforms {",
 		"  mat4 worldProj;",
 		"  vec3 cameraPos;",
@@ -61,7 +64,8 @@ final class GpuSkyExtension extends GpuExtension
 		"out vec4 fragColor;",
 		"const float PI = 3.14159265358979323846;",
 		"const float TWO_PI = 6.28318530717958647692;",
-		"vec2 skyUv(vec2 screen) {",
+		GalaxyStars.SHADER,
+		"vec3 skyDirection(vec2 screen) {",
 		"  float hh = horizontalFov * 0.5;",
 		"  float hv = atan(tan(hh) / max(aspect, 0.1));",
 		"  vec3 ray = normalize(vec3(screen.x * tan(hh), screen.y * tan(hv), 1.0));",
@@ -72,13 +76,15 @@ final class GpuSkyExtension extends GpuExtension
 		"  float ys = sin(yaw);",
 		"  float yc = cos(yaw);",
 		"  ray = vec3(ray.x * yc + ray.z * ys, ray.y, ray.z * yc - ray.x * ys);",
-		"  return vec2(atan(ray.x, ray.z) / TWO_PI, 0.5 + asin(clamp(ray.y, -1.0, 1.0)) / PI);",
+		"  return ray;",
 		"}",
 		"void main() {",
 		"  vec2 screen = vec2(fragUv.x * 2.0 - 1.0, (1.0 - fragUv.y) * 2.0 - 1.0);",
-		"  vec2 uv = skyUv(screen);",
+		"  vec3 ray = skyDirection(screen);",
+		"  vec2 uv = vec2(atan(ray.x, ray.z) / TWO_PI, 0.5 + asin(clamp(ray.y, -1.0, 1.0)) / PI);",
 		"  vec3 color = mix(textureLod(previousSky, uv, 0.0).rgb, textureLod(currentSky, uv, 0.0).rgb, skyBlend);",
-		"  fragColor = vec4(vec3(1.0) - exp(-color * exposure), 1.0);",
+		"  color = vec3(1.0) - exp(-gpuSkyAdjustColor(color) * exposure);",
+		"  fragColor = vec4(mix(color, vec3(1.0), galaxyStars(ray)), 1.0);",
 		"}");
 	private static final String SCENE_VERTEX_DEFINITIONS = String.join("\n",
 		"uniform sampler2D gpuSkyHeights;",
@@ -129,6 +135,7 @@ final class GpuSkyExtension extends GpuExtension
 		"// Absolute distance BEFORE interpolation prevents false seams across an unused floor height.",
 		"gpuSkyTerrainDistances = abs(gpuSkyHeightAtVertex(worldPos.xyz) - vec4(worldPos.y));");
 	private static final String SCENE_FRAGMENT_DEFINITIONS = String.join("\n",
+		SkyboxColorAdjustment.GLSL,
 		"#define GPU_SKY_LIGHTING_API 1",
 		"bool gpuSkyLightingApplied = false;",
 		"layout(std140) uniform uniforms {",
@@ -158,6 +165,8 @@ final class GpuSkyExtension extends GpuExtension
 		"uniform float gpuSkyUpperBrightness;",
 		"uniform float gpuSkySourceContrast;",
 		"uniform vec3 gpuSkyLightDirection;",
+		"uniform vec3 gpuSkySunRim;",
+		"uniform vec3 gpuSkySunDirection;",
 		"uniform int gpuWeatherGrade;",
 		"uniform int gpuSkySoftFacets;",
 		"in vec3 gpuSkyWorldPosition;",
@@ -169,10 +178,12 @@ final class GpuSkyExtension extends GpuExtension
 		"const float GPU_TWO_PI = 6.28318530717958647692;",
 		"const float GPU_ATMOSPHERE_SCALE = 0.50;",
 		"const float GPU_SKY_FACET_SOFTEN = 0.25;",
+		"uniform float gpuSkyCurrentLod;",
+		"uniform float gpuSkyPreviousLod;",
 		"vec3 gpuSkySampleRaw(vec2 uv) {",
-		"  vec3 a = textureLod(gpuSkyPrevious, uv, 7.0).rgb;",
-		"  vec3 b = textureLod(gpuSkyCurrent, uv, 7.0).rgb;",
-		"  return mix(a, b, gpuSkyBlend);",
+		"  vec3 a = textureLod(gpuSkyPrevious, uv, gpuSkyPreviousLod).rgb;",
+		"  vec3 b = textureLod(gpuSkyCurrent, uv, gpuSkyCurrentLod).rgb;",
+		"  return gpuSkyAdjustColor(mix(a, b, gpuSkyBlend));",
 		"}",
 		"vec3 gpuSkyAverage(float u, float v) {",
 		"  vec2 uv = vec2(u, clamp(v, 0.0, 1.0));",
@@ -232,7 +243,11 @@ final class GpuSkyExtension extends GpuExtension
 		"  float directionX = cameraRay.x * yc + rotatedZ * ys;",
 		"  float directionZ = -cameraRay.x * ys + rotatedZ * yc;",
 		"  float u = atan(directionX, directionZ) / GPU_TWO_PI;",
-		"  float v = 0.5 + asin(clamp(directionY, -1.0, 1.0)) / GPU_PI;",
+		// Scene directions are y-down (up is negative Y) but the panorama's v grows upward, so
+		// the sign is flipped here, for this lookup only. Before 2026-11-10 this was 0.5 + asin(...),
+		// which read the rim/backlight colour mirrored about the horizon. To compare or revert,
+		// change the minus back to a plus on the next line.
+		"  float v = 0.5 - asin(clamp(directionY, -1.0, 1.0)) / GPU_PI;",
 		"  return gpuSkyColorUv(vec2(u, v));",
 		"}",
 		"vec3 gpuSkyLightingColor(vec3 color) {",
@@ -262,14 +277,9 @@ final class GpuSkyExtension extends GpuExtension
 		"}");
 	// Cooperating material extensions can apply scene lighting first, regardless of registration order.
 	private static final String SCENE_FRAGMENT_LIGHTING = String.join("\n",
-		"void gpuSkyApplyLighting(vec4 c, vec4 fogColor, float fFogAmount) {",
-		"if (gpuSkyLightingApplied) return;",
-		"gpuSkyLightingApplied = true;",
-		"if (gpuSkyEnabled != 0) {",
+		"vec3 gpuSkyLightSurface(vec3 surfaceColor, float fFogAmount, bool terrain, out vec3 matchedFogColor) {",
 		"  vec3 sky = gpuSkyColorAt(gl_FragCoord.xy - gpuSkyViewportOrigin);",
-		"  vec3 surfaceColor = c.rgb;",
-		"  vec3 matchedFogColor = fogColor.rgb;",
-		"  float baseBrightness = max(c.r, max(c.g, c.b));",
+		"  float baseBrightness = max(surfaceColor.r, max(surfaceColor.g, surfaceColor.b));",
 		"  float darkSurfaceMask = smoothstep(0.04, 0.14, baseBrightness);",
 		"  vec3 view = normalize(cameraPos - gpuSkyWorldPosition);",
 		"  vec3 normal = cross(dFdx(gpuSkyWorldPosition), dFdy(gpuSkyWorldPosition));",
@@ -283,7 +293,6 @@ final class GpuSkyExtension extends GpuExtension
 		"  float softRimGain = gpuSkySoftFacets != 0 ? 1.50 : 1.0;",
 		"  float softBacklightGain = gpuSkySoftFacets != 0 ? 1.90 : 1.0;",
 		"  float softBroadGain = gpuSkySoftFacets != 0 ? 1.50 : 1.0;",
-		"  bool terrain = gpuSkyIsTerrain(gpuSkyWorldPosition);",
 		"  float viewYaw = -cameraYaw;",
 		"  vec3 side = normalize(vec3(cos(viewYaw), 0.0, -sin(viewYaw)));",
 		"  float visible = 1.0 - smoothstep(0.0, 0.82, clamp(fFogAmount, 0.0, 1.0));",
@@ -327,6 +336,19 @@ final class GpuSkyExtension extends GpuExtension
 		"    vec3 backlightSky = gpuSkyLightingColor(gpuSkyColorDirection(normal));",
 		"    surfaceColor += backlightSky * edge * directionalStrength * (1.0 - (gpuSkySoftFacets != 0 ? smoothstep(-0.95, 0.05, dot(normal, side)) : smoothstep(-0.65, -0.35, dot(normal, side)))) * 0.20 * gpuSkyBacklight * adaptiveBacklight * darkSurfaceMask * softBacklightGain;",
 		"  }",
+		"  // Sunlight/Moonlight glow: edges of models standing in front of the sun or moon catch its light.",
+		"  if (gpuSkySunRim != vec3(0.0) && !terrain && wallFade > 0.0) {",
+		"    float towardSun = smoothstep(0.78, 0.985, dot(-view, gpuSkySunDirection));",
+		"    float sunEdge = (gpuSkySoftFacets != 0 ? smoothstep(0.05, 1.0, 1.0 - clamp(dot(normal, view), 0.0, 1.0)) : smoothstep(0.30, 0.95, 1.0 - clamp(dot(normal, view), 0.0, 1.0))) * wallFade;",
+		"    surfaceColor += gpuSkySunRim * sunEdge * towardSun * 0.45 * darkSurfaceMask * softRimGain;",
+		"  }",
+		"  // A faint part of the glow bleeds over models right in front of the sun or moon; never over terrain.",
+		"  if (gpuSkySunRim != vec3(0.0) && !terrain && gpuSkyHeightMapEnabled != 0) {",
+		"    float sunAngle = acos(clamp(dot(-view, gpuSkySunDirection), -1.0, 1.0)) / " + SunHalo.TIGHT_RADIUS + ";",
+		"    vec3 sunBleed = clamp(gpuSkySunRim * " + (SunHalo.TIGHT_PEAK * SunHalo.BLEED) + " * exp(-sunAngle * sunAngle), 0.0, 1.0);",
+		"    // Screen blend, like the glow on the sky: bright surfaces gain less.",
+		"    surfaceColor = sunBleed + surfaceColor * (vec3(1.0) - sunBleed);",
+		"  }",
 		"  if (gpuSkyWorldLight > 0.0) {",
 		"    float distanceRatio = length(cameraPos - gpuSkyWorldPosition) / max(gpuSkyDrawDistance, 1.0);",
 		"    surfaceColor = mix(surfaceColor, sky, smoothstep(0.01, 1.0, distanceRatio) * 0.50 * gpuSkyWorldLight);",
@@ -339,8 +361,16 @@ final class GpuSkyExtension extends GpuExtension
 		"    vec3 ratio = clamp(tintSky / max(lum, 0.05), vec3(0.55), vec3(1.65));",
 		"    surfaceColor *= mix(vec3(1.0), ratio, 0.10 * gpuSkyTint * centerLightScale);",
 		"  }",
-		"  FragColor = vec4(mix(surfaceColor, matchedFogColor, fFogAmount), c.a);",
+		"  return surfaceColor;",
 		"}",
+		"void gpuSkyApplyLighting(vec4 c, vec4 fogColor, float fFogAmount) {",
+		"  if (gpuSkyLightingApplied) return;",
+		"  gpuSkyLightingApplied = true;",
+		"  if (gpuSkyEnabled != 0) {",
+		"    vec3 matchedFogColor;",
+		"    vec3 surfaceColor = gpuSkyLightSurface(c.rgb, fFogAmount, gpuSkyIsTerrain(gpuSkyWorldPosition), matchedFogColor);",
+		"    FragColor = vec4(mix(surfaceColor, matchedFogColor, fFogAmount), c.a);",
+		"  }",
 		"}");
 	private static final String SCENE_FRAGMENT_MAIN_POST = "gpuSkyApplyLighting(c, fogColor, fFogAmount);";
 
@@ -348,6 +378,10 @@ final class GpuSkyExtension extends GpuExtension
 	private final GpuSkyExtensionConfig config;
 	private final WeatherRenderer weatherRenderer = new WeatherRenderer();
 	private final LightWeatherFade lightWeatherFade = new LightWeatherFade();
+	/** Last frame's Sunlight/Moonlight glow strength; the scene shader's edge light uses it. */
+	private float sunHaloStrength;
+	private int haloProgram;
+	private final GalaxyStars galaxyStars = new GalaxyStars();
 	private final EnumMap<SkySlot, SkyboxAsset> images = new EnumMap<>(SkySlot.class);
 	private final Map<String, SkyboxAsset> preloadedImages = new HashMap<>();
 	private final EnumMap<SkySlot, SkyDirection> brightestSkyDirections = new EnumMap<>(SkySlot.class);
@@ -365,6 +399,7 @@ final class GpuSkyExtension extends GpuExtension
 	private int regionHorizontalFov = 110;
 	private int regionYawOffset = 160;
 	private int regionPitchOffset;
+	private TfaRoomSettings roomSettings = TfaRoomSettings.DEFAULT;
 	private int regionExposure = 110;
 	private boolean regionInheritLightSettings = true;
 	private int regionWorldLighting = 70;
@@ -373,6 +408,13 @@ final class GpuSkyExtension extends GpuExtension
 	private int regionSkyboxTint = 70;
 	private int regionAtmosphere = 70;
 	private OpenGlContext gpu;
+	// Client thread only. closed: the plugin shut this extension down for good.
+	// failed: a callback threw; stay stopped until the next GPU context.
+	private boolean closed;
+	private boolean failed;
+	private boolean failureLogged;
+	/** An Error other than out-of-memory happened: no retry on a new GPU context. */
+	private boolean disabledUntilRestart;
 	private volatile boolean contextReady;
 	private volatile int contextGeneration;
 	private final Runnable contextChanged;
@@ -398,6 +440,7 @@ final class GpuSkyExtension extends GpuExtension
 	private boolean heightMapDirty = true;
 	private int currentTexture;
 	private int previousTexture;
+	private final LightBeams.Source<SkyDirection> beamSource = new LightBeams.Source<>();
 	private SkyDirection currentSkyDirection = SkyDirection.UP;
 	private SkyDirection previousSkyDirection = SkyDirection.UP;
 	private float currentUpperSkyBrightness;
@@ -434,6 +477,11 @@ final class GpuSkyExtension extends GpuExtension
 	@Override
 	public String injectShaderExtension(String hook)
 	{
+		if (closed)
+		{
+			// A closed extension left registered (see GpuSkyExtensionPlugin.shutDown) adds nothing.
+			return null;
+		}
 		switch (hook)
 		{
 			case "rlst_vert_definitions":
@@ -452,41 +500,133 @@ final class GpuSkyExtension extends GpuExtension
 	@Override
 	public void onContextCreate()
 	{
-		ensureStarted();
+		if (closed || disabledUntilRestart)
+		{
+			return;
+		}
+		// A new GPU context is the point where a stopped extension tries again.
+		failed = false;
+		failureLogged = false;
+		try
+		{
+			ensureStarted();
+		}
+		catch (Throwable ex)
+		{
+			fail("starting", ex, false);
+		}
 	}
 
 	@Override
 	public void onContextDestroy()
 	{
-		destroyContext();
+		try
+		{
+			destroyContext();
+		}
+		catch (RuntimeException ex)
+		{
+			log.warn("Unable to release Skybox for GPU resources cleanly", ex);
+		}
 	}
 
 	@Override
 	public void onProgramCreate(int program)
 	{
-		ensureStarted();
-		sceneProgram = program;
-		gpu.cacheSceneUniforms(program,
-			"gpuSkyEnabled", "gpuSkyCurrent", "gpuSkyPrevious", "gpuSkyHeights",
-			"gpuSkyHeightMapEnabled", "gpuSkyHeightTextureSize", "gpuSkyHeightMapOffset",
-			"gpuSkyVertexOffsets", "gpuSkyVertexHeights", "gpuSkyVertexHeightsEnabled",
-			"gpuSkyFloorPresence", "gpuSkyBlend", "gpuSkyViewport", "gpuSkyViewportOrigin",
-			"gpuSkyFov", "gpuSkyAspect", "gpuSkyYawOffset", "gpuSkyPitchOffset",
-			"gpuSkyExposure", "gpuSkyDrawDistance", "gpuSkyWorldLight", "gpuSkyRimLight",
-			"gpuSkyBacklight", "gpuSkyTint", "gpuSkyAtmosphere", "gpuSkyUpperBrightness",
-			"gpuSkySourceContrast", "gpuSkyLightDirection", "gpuWeatherGrade", "gpuSkySoftFacets");
+		if (closed || failed)
+		{
+			// A new program starts with gpuSkyEnabled = 0, so the sky lighting stays off.
+			return;
+		}
+		try
+		{
+			ensureStarted();
+			sceneProgram = program;
+			gpu.cacheSceneUniforms(program,
+				"gpuSkyEnabled", "gpuSkyCurrent", "gpuSkyPrevious", "gpuSkyHeights",
+				"gpuSkyHeightMapEnabled", "gpuSkyHeightTextureSize", "gpuSkyHeightMapOffset",
+				"gpuSkyVertexOffsets", "gpuSkyVertexHeights", "gpuSkyVertexHeightsEnabled",
+				"gpuSkyFloorPresence", "gpuSkyBlend", "gpuSkyViewport", "gpuSkyViewportOrigin",
+				"gpuSkyFov", "gpuSkyAspect", "gpuSkyYawOffset", "gpuSkyPitchOffset",
+				"gpuSkyExposure", "gpuSkyHueSaturation", "gpuSkyDrawDistance", "gpuSkyWorldLight", "gpuSkyRimLight",
+				"gpuSkyBacklight", "gpuSkyTint", "gpuSkyAtmosphere", "gpuSkyUpperBrightness",
+				"gpuSkySourceContrast", "gpuSkyLightDirection", "gpuWeatherGrade", "gpuSkySoftFacets",
+				"gpuSkySunRim", "gpuSkySunDirection",
+				"gpuSkyCurrentLod", "gpuSkyPreviousLod");
+		}
+		catch (Throwable ex)
+		{
+			// The program may be mid-relink here, so only release our own resources.
+			fail("preparing the scene shader", ex, false);
+		}
+	}
+
+	/**
+	 * The API calls every extension in one loop without catching, so an exception here
+	 * would also skip Water's callback and the rest of the GPU plugin's frame. Instead,
+	 * switch the sky lighting off in the scene shader, release our GL resources and stay
+	 * stopped until the next GPU context (onContextCreate).
+	 */
+	private void fail(String during, Throwable ex, boolean switchOffInScene)
+	{
+		failed = true;
+		if (ex instanceof Error && !(ex instanceof OutOfMemoryError))
+		{
+			// Not something a new GPU context can fix (a linkage or internal error): stay off
+			// until the plugin is restarted.
+			disabledUntilRestart = true;
+		}
+		if (!failureLogged)
+		{
+			failureLogged = true;
+			log.warn("Skybox for GPU stopped after an error while {}; it starts again with the next GPU context",
+				during, ex);
+		}
+		int scene = sceneProgram;
+		if (switchOffInScene && scene != 0)
+		{
+			try
+			{
+				int previous = GL33C.glGetInteger(GL33C.GL_CURRENT_PROGRAM);
+				GL33C.glUseProgram(scene);
+				// Also the vertex-stage lookups: their textures are about to be deleted.
+				for (String flag : new String[]{"gpuSkyEnabled", "gpuSkyHeightMapEnabled", "gpuSkyVertexHeightsEnabled"})
+				{
+					int location = GL33C.glGetUniformLocation(scene, flag);
+					if (location >= 0)
+					{
+						GL33C.glUniform1i(location, 0);
+					}
+				}
+				GL33C.glUseProgram(previous);
+			}
+			catch (RuntimeException ignored)
+			{
+				// Releasing our resources below still matters.
+			}
+		}
+		try
+		{
+			destroyContext();
+		}
+		catch (RuntimeException cleanup)
+		{
+			log.debug("Releasing Skybox for GPU resources after the error also failed", cleanup);
+		}
 	}
 
 	@Override
 	public boolean drawSkybox()
 	{
-		if (sceneProgram == 0)
+		if (closed || failed || sceneProgram == 0)
 		{
 			return false;
 		}
-		OpenGlContext.DrawState state = new OpenGlContext.DrawState();
+		OpenGlContext.DrawState state = null;
 		try
 		{
+			// Inside the handler: a failure while reading GL state is contained like any other.
+			state = new OpenGlContext.DrawState();
 			ensureStarted();
 			long now = System.nanoTime();
 			resolveSkybox(now);
@@ -506,33 +646,78 @@ final class GpuSkyExtension extends GpuExtension
 			gpu.bindTexture("currentSky", currentTexture, 0);
 			gpu.bindTexture("previousSky", previousTexture == 0 ? currentTexture : previousTexture, 1);
 			gpu.uniform1f("skyBlend", transitionBlend(now));
+			gpu.uniform1f("galaxyVisibility", galaxyStars.update(activeWeather(), now));
+			gpu.uniform1f("galaxyTime", galaxyStars.seconds(now));
+			gpu.uniform1f("galaxyIntensity", GalaxyStars.intensity(activeWeatherIntensity()));
 			setProjectionUniforms(skyFov, skyAspect);
 			gpu.draw(buffer, 0, 6, OpenGlContext.Depth.NONE, OpenGlContext.Blend.ALPHA);
+			drawSunHalo(skyFov, skyAspect);
 			return true;
+		}
+		catch (Throwable ex)
+		{
+			fail("drawing the sky", ex, true);
+			return false;
 		}
 		finally
 		{
-			state.restore();
+			restore(state);
 		}
+	}
+
+	/**
+	 * The Sunlight/Moonlight glow, drawn onto the sky right after it and before the world, so
+	 * everything drawn later (terrain, models, water) covers it. It must not be drawn after
+	 * the world: water writes no depth, so open water would count as sky and get the glow.
+	 * Uses the strength worked out after the previous frame's world.
+	 */
+	private void drawSunHalo(float skyFov, float skyAspect)
+	{
+		SkyDirection beamSky = beamSource.shown();
+		if (!(sunHaloStrength > 0f) || haloProgram == 0 || beamSky == null)
+		{
+			return;
+		}
+		float[] haloColor = SunHalo.color(activeWeather(), beamSky.red, beamSky.green, beamSky.blue);
+		gpu.useProgram(haloProgram);
+		gpu.uniform1f("horizontalFov", skyFov);
+		gpu.uniform1f("aspect", skyAspect);
+		gpu.uniform1f("yawOffset", radians(activeYawOffset()));
+		gpu.uniform1f("pitchOffset", radians(activePitchOffset()));
+		gpu.uniform3f("haloDirection", beamSky.centreX, beamSky.centreY, beamSky.centreZ);
+		gpu.uniform3f("haloColor", haloColor[0], haloColor[1], haloColor[2]);
+		gpu.uniform1f("haloStrength", sunHaloStrength);
+		gpu.draw(buffer, 0, 6, OpenGlContext.Depth.NONE, OpenGlContext.Blend.SCREEN);
 	}
 
 	@Override
 	public void onPostDrawToplevel()
 	{
-		if (sceneProgram == 0)
+		if (closed || failed || sceneProgram == 0)
 		{
 			return;
 		}
-		OpenGlContext.DrawState state = new OpenGlContext.DrawState();
+		OpenGlContext.DrawState state = null;
 		try
 		{
+			// Inside the handler: a failure while reading GL state is contained like any other.
+			state = new OpenGlContext.DrawState();
 			ensureStarted();
 			GpuSkyExtensionConfig.WeatherEffect effect = activeWeather();
 			long now = System.nanoTime();
 			boolean weatherReady = effect != null && weatherRenderer.activate(effect);
-			// Hide the beams while their source direction moves between skybox images.
-			float lightWeatherOpacity = lightWeatherFade.update(effect,
-				weatherReady && transitionBlend(now) >= 1f, now);
+			// Sunlight/Moonlight beams need a sky to come from: hidden without one, faded in
+			// when it appears. When the sky changes they fade out at the light they show and
+			// in at the new one (also if the sky changes again mid-way), and a light detected
+			// near straight up (no sun or moon low in the sky) shows no beams.
+			beamSource.update(currentSkyDirection, now, config.instantTransitions());
+			SkyDirection beamSky = beamSource.shown();
+			float lightWeatherOpacity = lightWeatherFade.update(effect, weatherReady && currentTexture != 0, now)
+				* beamSource.opacity() * LightBeams.overheadOpacity(beamSky.elevation);
+			// The glow follows the beams: same light, same fades, nothing without a sun or moon.
+			sunHaloStrength = weatherReady && currentTexture != 0
+				? SunHalo.strength(effect, lightWeatherOpacity, beamSky.glow)
+				: 0f;
 			if (weatherReady)
 			{
 				int[] viewport = viewport();
@@ -543,21 +728,20 @@ final class GpuSkyExtension extends GpuExtension
 				float cameraPitch = client.getCameraFpPitch();
 				float anchorX = cameraX;
 				float anchorZ = cameraZ;
-				Player player = client.getLocalPlayer();
-				if (player != null)
+				// Main-world position, so weather stays around the player while sailing too.
+				LocalPoint local = MainWorldLocation.ofPlayer(client);
+				if (local != null)
 				{
-					LocalPoint local = player.getLocalLocation();
-					if (local != null)
-					{
-						anchorX = local.getX();
-						anchorZ = local.getY();
-					}
+					anchorX = local.getX();
+					anchorZ = local.getY();
 				}
-				SkyDirection moonDirection = activeMoonDirection(cameraPitch, cameraYaw, now);
+				// The rays come from a little below the middle of the sun or moon.
+				SkyDirection moonDirection = cameraDirection(beamSky.rayOrigin(), cameraPitch, cameraYaw);
 				weatherRenderer.draw(effect, viewport[2], viewport[3], activeWeatherIntensity(),
 					cameraX, cameraY, cameraZ, cameraYaw, cameraPitch, anchorX, anchorZ,
 					client.getScene(), client.getTileSettings(), client.getPlane(),
-					moonDirection.x, moonDirection.y, moonDirection.z, lightWeatherOpacity);
+					moonDirection.x, moonDirection.y, moonDirection.z, lightWeatherOpacity,
+					beamSky.red, beamSky.green, beamSky.blue);
 			}
 
 			// If RuneLite drew a scene-owned skybox, keep our scene shader inactive
@@ -565,14 +749,37 @@ final class GpuSkyExtension extends GpuExtension
 			gpu.useSceneProgram(sceneProgram);
 			gpu.uniform1i("gpuSkyEnabled", 0);
 		}
+		catch (Throwable ex)
+		{
+			fail("drawing weather", ex, true);
+		}
 		finally
 		{
-			state.restore();
+			restore(state);
 		}
 	}
 
+	/** Puts the host's GL state back; a failure here is logged, never thrown into the host's frame. */
+	private static void restore(OpenGlContext.DrawState state)
+	{
+		if (state == null)
+		{
+			return;
+		}
+		try
+		{
+			state.restore();
+		}
+		catch (RuntimeException ex)
+		{
+			log.debug("Unable to restore GL state after Skybox drawing", ex);
+		}
+	}
+
+	/** Releases everything; afterwards every API callback does nothing. Client thread only. */
 	void close()
 	{
+		closed = true;
 		completePreload();
 		destroyContext();
 		images.clear();
@@ -596,6 +803,7 @@ final class GpuSkyExtension extends GpuExtension
 		try
 		{
 			program = gpu.createProgram(VERTEX_SHADER, FRAGMENT_SHADER);
+			haloProgram = gpu.createProgram(VERTEX_SHADER, SunHalo.FRAGMENT_SHADER);
 			buffer = gpu.createBuffer();
 			gpu.upload(buffer, fullscreenQuad(), 6);
 			skyTextures = new SkyboxTextures(new SkyboxTextures.Backend()
@@ -615,7 +823,11 @@ final class GpuSkyExtension extends GpuExtension
 			contextGeneration++;
 			setContextReady(true);
 			weatherRenderer.start(gpu);
-			for (WeatherRenderer.LoadedWeatherAssets assets : weatherAssets.values())
+			// Only weather that arrived while there was no context; uploaded weather is not
+			// kept in memory, so after a context change the loader decodes it again.
+			List<WeatherRenderer.LoadedWeatherAssets> pending = new ArrayList<>(weatherAssets.values());
+			weatherAssets.clear();
+			for (WeatherRenderer.LoadedWeatherAssets assets : pending)
 			{
 				publishWeather(assets);
 			}
@@ -628,6 +840,8 @@ final class GpuSkyExtension extends GpuExtension
 			nextGpu.close();
 			gpu = null;
 			program = 0;
+			haloProgram = 0;
+			sunHaloStrength = 0f;
 			buffer = 0;
 			skyTextures = null;
 			throw ex;
@@ -638,6 +852,7 @@ final class GpuSkyExtension extends GpuExtension
 	{
 		sceneProgram = 0;
 		lightWeatherFade.reset();
+		galaxyStars.reset();
 		setContextReady(false);
 		completePreload();
 		images.clear();
@@ -652,6 +867,8 @@ final class GpuSkyExtension extends GpuExtension
 			gpu = null;
 		}
 		program = 0;
+		haloProgram = 0;
+		sunHaloStrength = 0f;
 		buffer = 0;
 		heightTexture = 0;
 		vertexOffsetTexture = vertexHeightTexture = floorPresenceTexture = correctedVertices = 0;
@@ -670,6 +887,7 @@ final class GpuSkyExtension extends GpuExtension
 		previousTexture = 0;
 		currentSkyDirection = SkyDirection.UP;
 		previousSkyDirection = SkyDirection.UP;
+		beamSource.reset();
 		currentUpperSkyBrightness = 0f;
 		previousUpperSkyBrightness = 0f;
 		currentSkySourceContrast = 0f;
@@ -702,6 +920,9 @@ final class GpuSkyExtension extends GpuExtension
 			gpu.uniform1f("gpuSkyHeightMapOffset", heightMapOffset);
 		}
 		gpu.uniform1f("gpuSkyBlend", transitionBlend(now));
+		int lightingPrevious = previousTexture == 0 ? currentTexture : previousTexture;
+		gpu.uniform1f("gpuSkyCurrentLod", lightingLod(gpu.textureWidth(currentTexture)));
+		gpu.uniform1f("gpuSkyPreviousLod", lightingLod(gpu.textureWidth(lightingPrevious)));
 		// gl_FragCoord still needs the physical viewport; ray projection uses logical dimensions.
 		gpu.uniform2f("gpuSkyViewport", width, height);
 		gpu.uniform2f("gpuSkyViewportOrigin", viewport[0], viewport[1]);
@@ -710,6 +931,7 @@ final class GpuSkyExtension extends GpuExtension
 		gpu.uniform1f("gpuSkyYawOffset", radians(activeYawOffset()));
 		gpu.uniform1f("gpuSkyPitchOffset", radians(activePitchOffset()));
 		gpu.uniform1f("gpuSkyExposure", activeExposure() / 100f);
+		gpu.uniform2f("gpuSkyHueSaturation", roomSettings.hueOffset, roomSettings.saturationOffset);
 		gpu.uniform1f("gpuSkyDrawDistance",
 			client.getScene().getDrawDistance() * (float) Perspective.LOCAL_TILE_SIZE);
 		gpu.uniform1f("gpuSkyWorldLight", activeWorldLighting() / 100f);
@@ -725,6 +947,21 @@ final class GpuSkyExtension extends GpuExtension
 		gpu.uniform3f("gpuSkyLightDirection", lightDirection.x, lightDirection.y, lightDirection.z);
 		GpuSkyExtensionConfig.WeatherEffect effect = activeWeather();
 		gpu.uniform1i("gpuWeatherGrade", effect == null ? 0 : effect.shaderGrade());
+		// Edge light for models in front of the sun or moon; uses the glow strength of the last frame.
+		SkyDirection sunSky = beamSource.shown();
+		float sunRim = sunSky == null ? 0f : sunHaloStrength;
+		if (sunRim > 0f)
+		{
+			float[] sunColor = SunHalo.color(effect, sunSky.red, sunSky.green, sunSky.blue);
+			SkyDirection sunDirection = cameraDirection(sunSky.centre(),
+				client.getCameraFpPitch(), client.getCameraFpYaw());
+			gpu.uniform3f("gpuSkySunRim", sunColor[0] * sunRim, sunColor[1] * sunRim, sunColor[2] * sunRim);
+			gpu.uniform3f("gpuSkySunDirection", sunDirection.x, sunDirection.y, sunDirection.z);
+		}
+		else
+		{
+			gpu.uniform3f("gpuSkySunRim", 0f, 0f, 0f);
+		}
 	}
 
 	void invalidateHeightMap()
@@ -917,9 +1154,10 @@ final class GpuSkyExtension extends GpuExtension
 		boolean skyboxDisabled,
 		boolean inheritSkySettings, int horizontalFov, int yawOffset, int pitchOffset, int exposure,
 		boolean inheritLightSettings, int worldLighting, int rimLighting, int backlighting,
-		int skyboxTint, int atmosphere)
+		int skyboxTint, int atmosphere, TfaRoomSettings roomSettings)
 	{
 		this.regionOverrideActive = active;
+		this.roomSettings = active ? roomSettings : TfaRoomSettings.DEFAULT;
 		this.regionWeather = weather;
 		this.regionWeatherIntensity = weatherIntensity;
 		this.regionSkyboxDisabled = skyboxDisabled;
@@ -938,11 +1176,16 @@ final class GpuSkyExtension extends GpuExtension
 
 	void uploadWeather(WeatherRenderer.LoadedWeatherAssets assets, Consumer<Boolean> complete)
 	{
-		weatherAssets.put(assets.effect(), assets);
 		weatherCompletions.put(assets.effect(), complete);
 		if (gpu != null)
 		{
+			weatherAssets.remove(assets.effect());
 			publishWeather(assets);
+		}
+		else
+		{
+			// Uploaded when the next context starts.
+			weatherAssets.put(assets.effect(), assets);
 		}
 	}
 
@@ -972,7 +1215,7 @@ final class GpuSkyExtension extends GpuExtension
 		}
 		images.put(slot, image);
 		SkyAnalysis analysis = image.analysis;
-		brightestSkyDirections.put(slot, analysis.direction);
+		brightestSkyDirections.put(slot, analysis.direction.withGlow(image.glowStrength));
 		skySourceContrasts.put(slot, analysis.sourceContrast);
 		upperSkyBrightnesses.put(slot, image.upperBrightness);
 	}
@@ -1021,7 +1264,12 @@ final class GpuSkyExtension extends GpuExtension
 
 	private SkyDirection activeMoonDirection(float cameraPitch, float cameraYaw, long now)
 	{
-		SkyDirection direction = activeSkyDirection(now);
+		return cameraDirection(activeSkyDirection(now), cameraPitch, cameraYaw);
+	}
+
+	/** A sky-image direction placed with the sky's yaw/pitch offsets, in the camera-relative frame the shaders use. */
+	private SkyDirection cameraDirection(SkyDirection direction, float cameraPitch, float cameraYaw)
+	{
 
 		float yaw = -cameraYaw + radians(activeYawOffset());
 		float yawSin = (float) Math.sin(yaw);
@@ -1115,9 +1363,15 @@ final class GpuSkyExtension extends GpuExtension
 
 		float u = (brightestColumn + 0.5f) / columns;
 		float imageV = (brightestRow + 0.5f) / rows * imageHeightFraction;
+		float[] lightColor = sampleLightColor(image, u, imageV);
 		float azimuth = u * (float) (Math.PI * 2.0);
 		float elevation = (0.5f - imageV) * (float) Math.PI;
 		float horizontal = (float) Math.cos(elevation);
+		// The search grid is coarse (a few degrees); the glow needs the middle of the light itself.
+		float[] centre = SunHalo.lightCentre(image, u, imageV);
+		float centreAzimuth = centre[0] * (float) (Math.PI * 2.0);
+		float centreElevation = (0.5f - centre[1]) * (float) Math.PI;
+		float centreHorizontal = (float) Math.cos(centreElevation);
 		float averageLuminance = luminanceTotal / (rows * columns);
 		float prominence = (brightest - averageLuminance) / Math.max(averageLuminance, 0.05f);
 		float sourceContrast = Math.max(0f, Math.min(1f, (prominence - 0.10f) / 0.90f));
@@ -1126,7 +1380,67 @@ final class GpuSkyExtension extends GpuExtension
 			-(float) Math.sin(elevation),
 			(float) Math.cos(azimuth) * horizontal,
 			azimuth,
-			elevation), sourceContrast);
+			elevation,
+			lightColor[0], lightColor[1], lightColor[2],
+			(float) Math.sin(centreAzimuth) * centreHorizontal,
+			-(float) Math.sin(centreElevation),
+			(float) Math.cos(centreAzimuth) * centreHorizontal), sourceContrast);
+	}
+
+	/**
+	 * Colour of the light itself: the brightest pixels (within 90% of the brightest) in about
+	 * 4 degrees around the detected point, so a white cloud gives white and not the blue sky
+	 * around it. Returned at full brightness.
+	 */
+	static float[] sampleLightColor(BufferedImage image, float u, float imageV)
+	{
+		final int steps = 32;
+		final float halfU = 4f / 360f;
+		final float halfV = 3f / 180f;
+		int count = (2 * steps + 1) * (2 * steps + 1);
+		int[] samples = new int[count];
+		float[] luminance = new float[count];
+		float brightest = 0f;
+		int index = 0;
+		for (int row = -steps; row <= steps; row++)
+		{
+			float v = Math.max(0f, Math.min(1f, imageV + halfV * row / steps));
+			int y = Math.min(image.getHeight() - 1, (int) (v * image.getHeight()));
+			for (int column = -steps; column <= steps; column++)
+			{
+				float sampleU = u + halfU * column / steps;
+				int x = Math.floorMod((int) Math.floor(sampleU * image.getWidth()), image.getWidth());
+				int rgb = image.getRGB(x, y);
+				float value = ((rgb >> 16) & 0xff) * 0.2126f + ((rgb >> 8) & 0xff) * 0.7152f + (rgb & 0xff) * 0.0722f;
+				samples[index] = rgb;
+				luminance[index++] = value;
+				brightest = Math.max(brightest, value);
+			}
+		}
+		float red = 0f;
+		float green = 0f;
+		float blue = 0f;
+		for (int i = 0; i < count; i++)
+		{
+			if (luminance[i] >= brightest * 0.9f)
+			{
+				red += (samples[i] >> 16) & 0xff;
+				green += (samples[i] >> 8) & 0xff;
+				blue += samples[i] & 0xff;
+			}
+		}
+		return lightColor(red, green, blue);
+	}
+
+	/** A sampled colour at full brightness (brightest channel 1), so the hue is kept but not the dimness. */
+	static float[] lightColor(float red, float green, float blue)
+	{
+		float max = Math.max(red, Math.max(green, blue));
+		if (max <= 0.0001f)
+		{
+			return new float[]{1f, 1f, 1f};
+		}
+		return new float[]{red / max, green / max, blue / max};
 	}
 
 	private float transitionBlend(long now)
@@ -1238,8 +1552,11 @@ final class GpuSkyExtension extends GpuExtension
 
 	private boolean isCave()
 	{
-		Player player = client.getLocalPlayer();
-		return player != null && WorldPoint.getMirrorPoint(player.getWorldLocation(), true).getY() >= Constants.OVERWORLD_MAX_Y;
+		// On a boat the player's own position is in the boat's coordinates, which can count as a
+		// cave; use the boat's place in the main world (RuneLite PR #20642).
+		LocalPoint local = MainWorldLocation.ofPlayer(client);
+		return local != null
+			&& WorldPoint.getMirrorPoint(WorldPoint.fromLocal(client, local), true).getY() >= Constants.OVERWORLD_MAX_Y;
 	}
 
 	private void setProjectionUniforms(float skyFov, float skyAspect)
@@ -1249,6 +1566,7 @@ final class GpuSkyExtension extends GpuExtension
 		gpu.uniform1f("yawOffset", radians(activeYawOffset()));
 		gpu.uniform1f("pitchOffset", radians(activePitchOffset()));
 		gpu.uniform1f("exposure", activeExposure() / 100f);
+		gpu.uniform2f("gpuSkyHueSaturation", roomSettings.hueOffset, roomSettings.saturationOffset);
 	}
 
 	static float horizontalFov(int logicalWidth, int cameraScale, int configuredFov)
@@ -1277,7 +1595,7 @@ final class GpuSkyExtension extends GpuExtension
 
 	private int activePitchOffset()
 	{
-		return useRegionSkySettings() ? regionPitchOffset : config.pitchOffset();
+		return roomSettings.pitch(useRegionSkySettings() ? regionPitchOffset : config.pitchOffset());
 	}
 
 	private int activeExposure()
@@ -1341,6 +1659,16 @@ final class GpuSkyExtension extends GpuExtension
 		return vertices;
 	}
 
+	/** Mip level that is about LIGHTING_SAMPLE_WIDTH wide: 7 at 8K, 6 at 4K, 5 at 2K. */
+	static float lightingLod(int textureWidth)
+	{
+		if (textureWidth <= 0)
+		{
+			return 7f;
+		}
+		return Math.max(0f, (float) (Math.log(textureWidth / LIGHTING_SAMPLE_WIDTH) / Math.log(2)));
+	}
+
 	private static void vertex(float[] vertices, int index, float x, float y, float u, float v)
 	{
 		int offset = index * OpenGlContext.VERTEX_STRIDE_FLOATS;
@@ -1359,6 +1687,25 @@ final class GpuSkyExtension extends GpuExtension
 
 	private static final class SkyDirection
 	{
+		/** The middle of the sun or moon as a direction of its own. */
+		SkyDirection centre()
+		{
+			return new SkyDirection(centreX, centreY, centreZ, 0f, 0f);
+		}
+
+		/** Where the Sunlight/Moonlight rays come from: slightly below the middle. */
+		SkyDirection rayOrigin()
+		{
+			float[] lowered = LightBeams.lowered(centreX, centreY, centreZ, LightBeams.RAY_ORIGIN_DROP);
+			return new SkyDirection(lowered[0], lowered[1], lowered[2], 0f, 0f);
+		}
+
+		SkyDirection withGlow(float strength)
+		{
+			return strength == glow ? this
+				: new SkyDirection(x, y, z, azimuth, elevation, red, green, blue, centreX, centreY, centreZ, strength);
+		}
+
 		private static final SkyDirection UP = new SkyDirection(0f, -1f, 0f, 0f, (float) Math.PI * 0.5f);
 
 		private final float x;
@@ -1366,14 +1713,48 @@ final class GpuSkyExtension extends GpuExtension
 		private final float z;
 		private final float azimuth;
 		private final float elevation;
+		/** Colour of the light found there, at full brightness; Sunlight/Moonlight beams use it. */
+		private final float red;
+		private final float green;
+		private final float blue;
+		/** Middle of the sun or moon itself (sky-image frame); the glow is centred here. */
+		private final float centreX;
+		private final float centreY;
+		private final float centreZ;
+		/** Glow strength of the sky this light belongs to (1 = full). */
+		private final float glow;
 
 		private SkyDirection(float x, float y, float z, float azimuth, float elevation)
 		{
+			this(x, y, z, azimuth, elevation, 1f, 1f, 1f);
+		}
+
+		private SkyDirection(float x, float y, float z, float azimuth, float elevation, float red, float green, float blue)
+		{
+			this(x, y, z, azimuth, elevation, red, green, blue, x, y, z);
+		}
+
+		private SkyDirection(float x, float y, float z, float azimuth, float elevation, float red, float green, float blue,
+			float centreX, float centreY, float centreZ)
+		{
+			this(x, y, z, azimuth, elevation, red, green, blue, centreX, centreY, centreZ, 1f);
+		}
+
+		private SkyDirection(float x, float y, float z, float azimuth, float elevation, float red, float green, float blue,
+			float centreX, float centreY, float centreZ, float glow)
+		{
+			this.glow = glow;
+			this.centreX = centreX;
+			this.centreY = centreY;
+			this.centreZ = centreZ;
 			this.x = x;
 			this.y = y;
 			this.z = z;
 			this.azimuth = azimuth;
 			this.elevation = elevation;
+			this.red = red;
+			this.green = green;
+			this.blue = blue;
 		}
 	}
 

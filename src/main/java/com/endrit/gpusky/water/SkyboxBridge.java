@@ -17,6 +17,7 @@ final class SkyboxBridge
 	private int program;
 	private int enabledLoc = -1, currentLoc = -1, previousLoc = -1, blendLoc = -1,
 		yawLoc = -1, pitchLoc = -1, exposureLoc = -1, lightLoc = -1, contrastLoc = -1,
+		currentLodLoc = -1, previousLodLoc = -1,
 		fovLoc = -1, aspectLoc = -1, viewportLoc = -1, originLoc = -1, drawDistanceLoc = -1, worldLightLoc = -1;
 	private final float[] pair = new float[2];
 	private int analysedTexture;
@@ -39,6 +40,8 @@ final class SkyboxBridge
 	boolean available;
 	int currentTexture, previousTexture;
 	float blend, yawOffset, pitchOffset, exposure;
+	/** Mip levels Skybox's lighting samples the current and previous sky at (they depend on each texture's width). */
+	float currentLod = 7f, previousLod = 7f;
 	/** How much the brightest point stands out: 0 = flat/overcast sky, 1 = clear sun or moon. */
 	float sourceContrast = 1f;
 	/** The skybox's own screen projection and distance fade, so water fog matches the scene. */
@@ -57,6 +60,8 @@ final class SkyboxBridge
 		yawLoc = GL33C.glGetUniformLocation(program, "gpuSkyYawOffset");
 		pitchLoc = GL33C.glGetUniformLocation(program, "gpuSkyPitchOffset");
 		exposureLoc = GL33C.glGetUniformLocation(program, "gpuSkyExposure");
+		currentLodLoc = GL33C.glGetUniformLocation(program, "gpuSkyCurrentLod");
+		previousLodLoc = GL33C.glGetUniformLocation(program, "gpuSkyPreviousLod");
 		lightLoc = GL33C.glGetUniformLocation(program, "gpuSkyLightDirection");
 		contrastLoc = GL33C.glGetUniformLocation(program, "gpuSkySourceContrast");
 		fovLoc = GL33C.glGetUniformLocation(program, "gpuSkyFov");
@@ -81,6 +86,8 @@ final class SkyboxBridge
 		yawOffset = yawLoc < 0 ? 0f : GL33C.glGetUniformf(program, yawLoc);
 		pitchOffset = pitchLoc < 0 ? 0f : GL33C.glGetUniformf(program, pitchLoc);
 		exposure = GL33C.glGetUniformf(program, exposureLoc);
+		currentLod = currentLodLoc < 0 ? 7f : GL33C.glGetUniformf(program, currentLodLoc);
+		previousLod = previousLodLoc < 0 ? 7f : GL33C.glGetUniformf(program, previousLodLoc);
 		sourceContrast = contrastLoc < 0 ? 1f : Math.max(0f, Math.min(1f, GL33C.glGetUniformf(program, contrastLoc)));
 		GL33C.glGetUniformfv(program, lightLoc, light);
 		float length = (float) Math.sqrt(light[0] * light[0] + light[1] * light[1] + light[2] * light[2]);
